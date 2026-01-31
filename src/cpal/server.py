@@ -13,6 +13,8 @@ import glob as globlib
 import logging
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,7 @@ MAX_FILE_SIZE = 10 * 1024 * 1024     # 10 MB - prevents accidental DOS
 MAX_INLINE_MEDIA = 20 * 1024 * 1024  # 20 MB - inline media limit
 MAX_SEARCH_FILES = 1000
 MAX_SEARCH_MATCHES = 20
+SESSION_TTL = 3600  # 1 hour - sessions expire after this
 # Default tool call limits per model tier (can be overridden per-call)
 DEFAULT_TOOL_CALLS = {
     "haiku": 50,   # Cheap and fast - let it rip
@@ -79,6 +82,42 @@ def is_text_file(path: str) -> bool:
     return ext in TEXT_EXTENSIONS
 
 
+# Project root for path validation (set on first tool use)
+_project_root: Path | None = None
+
+
+def _validate_path(path: str) -> Path:
+    """
+    Ensure path is within the project directory.
+
+    Prevents path traversal attacks that could access sensitive files
+    like /etc/passwd or ~/.ssh/id_rsa.
+    """
+    global _project_root
+    if _project_root is None:
+        _project_root = Path.cwd().resolve()
+
+    try:
+        # Handle both absolute and relative paths
+        target = Path(path)
+        if target.is_absolute():
+            resolved = target.resolve()
+        else:
+            resolved = (_project_root / path).resolve()
+
+        # Check if resolved path is within project root
+        try:
+            resolved.relative_to(_project_root)
+        except ValueError:
+            raise ValueError(f"Path '{path}' is outside project directory")
+
+        return resolved
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Invalid path '{path}': {e}")
+
+
 SYSTEM_PROMPT = """\
 You are a consultant AI accessed via the Model Context Protocol (MCP).
 Your role is to provide high-agency, deep reasoning and analysis on tasks,
@@ -98,8 +137,38 @@ complete context before providing your analysis.
 mcp = FastMCP("cpal")
 
 # Sessions store conversation history
-# Format: {session_id: {"messages": [...], "model": "..."}}
+# Format: {session_id: {"messages": [...], "model": "...", "last_access": timestamp}}
 sessions: dict[str, dict[str, Any]] = {}
+
+# Thread safety for concurrent session access
+_session_locks: dict[str, threading.Lock] = {}
+_locks_lock = threading.Lock()
+
+# Logger
+logger = logging.getLogger("cpal")
+
+
+def get_session_lock(session_id: str) -> threading.Lock:
+    """Get or create a lock for a session."""
+    with _locks_lock:
+        if session_id not in _session_locks:
+            _session_locks[session_id] = threading.Lock()
+        return _session_locks[session_id]
+
+
+def cleanup_old_sessions() -> int:
+    """Remove sessions that haven't been accessed within SESSION_TTL. Returns count removed."""
+    now = time.time()
+    to_remove = [
+        sid for sid, sess in sessions.items()
+        if now - sess.get("last_access", 0) > SESSION_TTL
+    ]
+    for sid in to_remove:
+        del sessions[sid]
+        with _locks_lock:
+            if sid in _session_locks:
+                del _session_locks[sid]
+    return len(to_remove)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Claude Internal Tools (for autonomous exploration)
@@ -162,23 +231,37 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
     if name == "list_directory":
         path = input_data.get("path", ".")
         try:
-            p = Path(path)
+            p = _validate_path(path)
             if not p.exists():
                 return f"Error: Path '{path}' does not exist."
+            if not p.is_dir():
+                return f"Error: '{path}' is not a directory."
             items = [item.name for item in p.iterdir()]
-            return "\n".join(items) if items else "(empty directory)"
+            return "\n".join(sorted(items)) if items else "(empty directory)"
+        except ValueError as e:
+            return f"Error: {e}"
         except Exception as e:
             return f"Error listing directory: {e}"
 
     elif name == "read_file":
         path = input_data.get("path", "")
         try:
-            p = Path(path)
+            p = _validate_path(path)
             if not p.exists():
                 return f"Error: File '{path}' does not exist."
+            if not p.is_file():
+                return f"Error: '{path}' is not a file."
             if p.stat().st_size > MAX_FILE_SIZE:
                 return f"Error: File '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
-            return p.read_text(encoding="utf-8")
+            try:
+                return p.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                return (
+                    f"Error: File '{path}' appears to be binary (not UTF-8 text). "
+                    f"Size: {p.stat().st_size} bytes."
+                )
+        except ValueError as e:
+            return f"Error: {e}"
         except Exception as e:
             return f"Error reading file '{path}': {e}"
 
@@ -196,13 +279,23 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
             for filepath in files:
                 if not os.path.isfile(filepath):
                     continue
+                # Validate path is within project
                 try:
+                    _validate_path(filepath)
+                except ValueError:
+                    continue
+
+                try:
+                    # Line-by-line search for memory efficiency
                     with open(filepath, encoding="utf-8", errors="ignore") as f:
-                        if search_term in f.read():
-                            matches.append(f"Match in: {filepath}")
-                            if len(matches) >= MAX_SEARCH_MATCHES:
-                                matches.append("... (truncated)")
-                                break
+                        for line_num, line in enumerate(f, 1):
+                            if search_term in line:
+                                matches.append(f"{filepath}:{line_num}")
+                                if len(matches) >= MAX_SEARCH_MATCHES:
+                                    break
+                    if len(matches) >= MAX_SEARCH_MATCHES:
+                        matches.append("... (truncated)")
+                        break
                 except OSError:
                     continue
             return "\n".join(matches) if matches else "No matches found."
@@ -231,11 +324,20 @@ def get_session(session_id: str, model_alias: str) -> dict[str, Any]:
     """Get or create a session, migrating history when switching models."""
     target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
 
+    # Periodically cleanup old sessions (cheap check)
+    if len(sessions) > 100:
+        cleanup_old_sessions()
+
     if session_id not in sessions:
-        sessions[session_id] = {"messages": [], "model": target_model}
+        sessions[session_id] = {
+            "messages": [],
+            "model": target_model,
+            "last_access": time.time(),
+        }
         return sessions[session_id]
 
     session = sessions[session_id]
+    session["last_access"] = time.time()
     current_model = session.get("model")
 
     if current_model != target_model:
@@ -365,12 +467,24 @@ def run_agentic_loop(
 
         # Check if we're done (no tool use)
         if response.stop_reason == "end_turn":
-            # Extract text from response
+            # Extract text and thinking from response
             text_parts = []
+            thinking_parts = []
             for block in response.content:
                 if block.type == "text":
                     text_parts.append(block.text)
-            return "\n".join(text_parts), messages
+                elif block.type == "thinking":
+                    thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
+
+            # Add final assistant response to history (preserving content blocks)
+            messages.append({"role": "assistant", "content": response.content})
+
+            # Include thinking if present
+            if thinking_parts:
+                result = "\n\n".join(thinking_parts + text_parts)
+            else:
+                result = "\n".join(text_parts)
+            return result, messages
 
         # Handle tool use
         if response.stop_reason == "tool_use":
@@ -396,14 +510,45 @@ def run_agentic_loop(
             kwargs["messages"] = messages
             continue
 
+        # Handle max_tokens - response was truncated
+        if response.stop_reason == "max_tokens":
+            text_parts = []
+            thinking_parts = []
+            for block in response.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+                elif block.type == "thinking":
+                    thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
+
+            messages.append({"role": "assistant", "content": response.content})
+
+            if thinking_parts:
+                result = "\n\n".join(thinking_parts + text_parts)
+            else:
+                result = "\n".join(text_parts)
+            return f"{result}\n\n[Response truncated - max tokens reached]", messages
+
         # Unknown stop reason - extract what we have
         text_parts = []
+        thinking_parts = []
         for block in response.content:
             if block.type == "text":
                 text_parts.append(block.text)
-        return "\n".join(text_parts) or f"Stopped: {response.stop_reason}", messages
+            elif block.type == "thinking":
+                thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
 
-    return "Error: Maximum tool calls exceeded.", messages
+        messages.append({"role": "assistant", "content": response.content})
+
+        if thinking_parts:
+            result = "\n\n".join(thinking_parts + text_parts)
+        else:
+            result = "\n".join(text_parts)
+        return result or f"Stopped: {response.stop_reason}", messages
+
+    # Max tool calls exceeded
+    error_msg = f"Reached maximum tool calls ({max_tool_calls}). Please continue in a new query."
+    messages.append({"role": "assistant", "content": error_msg})
+    return error_msg, messages
 
 
 def _consult(
@@ -417,40 +562,50 @@ def _consult(
     max_tool_calls: int | None = None,
 ) -> str:
     """Send a query to Claude with optional file/media context."""
+    # Input validation
+    if not query or not query.strip():
+        return "Error: Query cannot be empty."
+
+    if thinking_budget < 1000 or thinking_budget > 100000:
+        return "Error: thinking_budget must be between 1000 and 100000."
+
     client = get_client()
-    session = get_session(session_id, model_alias)
-    model = session["model"]
 
-    # Use tier-specific default if not specified
-    if max_tool_calls is None:
-        max_tool_calls = DEFAULT_TOOL_CALLS.get(model_alias.lower(), 25)
+    # Use session lock to prevent concurrent access corruption
+    lock = get_session_lock(session_id)
+    with lock:
+        session = get_session(session_id, model_alias)
+        model = session["model"]
 
-    # Build the user message content
-    content = build_content_blocks(query, file_paths, media_paths)
+        # Use tier-specific default if not specified
+        if max_tool_calls is None:
+            max_tool_calls = DEFAULT_TOOL_CALLS.get(model_alias.lower(), 25)
 
-    # Add to message history
-    session["messages"].append({"role": "user", "content": content})
+        # Build the user message content
+        content = build_content_blocks(query, file_paths, media_paths)
 
-    try:
-        response_text, updated_messages = run_agentic_loop(
-            client,
-            model,
-            session["messages"],
-            extended_thinking=extended_thinking,
-            thinking_budget=thinking_budget,
-            max_tool_calls=max_tool_calls,
-        )
-        session["messages"] = updated_messages
+        # Add to message history
+        session["messages"].append({"role": "user", "content": content})
 
-        # Add assistant response to history
-        session["messages"].append({"role": "assistant", "content": response_text})
+        try:
+            response_text, updated_messages = run_agentic_loop(
+                client,
+                model,
+                session["messages"],
+                extended_thinking=extended_thinking,
+                thinking_budget=thinking_budget,
+                max_tool_calls=max_tool_calls,
+            )
+            session["messages"] = updated_messages
 
-        return response_text
+            return response_text
 
-    except anthropic.APIError as e:
-        return f"Error communicating with Claude: {e}"
-    except Exception as e:
-        return f"Error: {e}"
+        except anthropic.APIError as e:
+            logger.error(f"API error for session {session_id}: {e}")
+            return f"Error communicating with Claude: {e}"
+        except Exception as e:
+            logger.error(f"Error in session {session_id}: {e}")
+            return f"Error: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -462,7 +617,7 @@ def _consult(
 def consult_claude(
     query: str,
     session_id: str = "default",
-    model: str = "opus",
+    model: str = "sonnet",
     file_paths: list[str] | None = None,
     media_paths: list[str] | None = None,
     extended_thinking: bool = False,
@@ -479,13 +634,14 @@ def consult_claude(
     Args:
         query: The question or instruction.
         session_id: ID for conversation history (preserved across calls).
-        model: Model tier — "opus" (deep reasoning, default), "sonnet" (balanced), "haiku" (fast).
+        model: Model tier — "sonnet" (balanced, default), "opus" (deep reasoning), "haiku" (fast).
         file_paths: Text files to include as context.
         media_paths: Images (.png, .jpg, .webp, .gif) or PDFs for vision analysis.
         extended_thinking: Enable explicit chain-of-thought reasoning (Opus/Sonnet only).
         thinking_budget: Max tokens for thinking (default 10000, max ~100000).
         max_tool_calls: Max autonomous tool calls (default varies by model).
     """
+    logger.debug(f"consult_claude: session={session_id}, model={model}")
     return _consult(
         query, session_id, model, file_paths, media_paths,
         extended_thinking, thinking_budget, max_tool_calls
@@ -500,6 +656,12 @@ def consult_claude(
 def main() -> None:
     global _api_key
 
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
     parser = argparse.ArgumentParser(
         description="cpal - Claude Principal Assistant Layer MCP server"
     )
@@ -508,7 +670,15 @@ def main() -> None:
         type=Path,
         help="Path to file containing Anthropic API key (alternative to ANTHROPIC_API_KEY env)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
     args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger("cpal").setLevel(logging.DEBUG)
 
     if args.key_file:
         if not args.key_file.exists():
@@ -516,6 +686,7 @@ def main() -> None:
             sys.exit(1)
         _api_key = args.key_file.read_text().strip()
 
+    logger.info("Starting cpal MCP server")
     mcp.run()
 
 
