@@ -91,7 +91,8 @@ def _validate_path(path: str) -> Path:
     Ensure path is within the project directory.
 
     Prevents path traversal attacks that could access sensitive files
-    like /etc/passwd or ~/.ssh/id_rsa.
+    like /etc/passwd or ~/.ssh/id_rsa. Also prevents symlink attacks
+    where a symlink inside the project points to files outside.
     """
     global _project_root
     if _project_root is None:
@@ -106,10 +107,23 @@ def _validate_path(path: str) -> Path:
             resolved = (_project_root / path).resolve()
 
         # Check if resolved path is within project root
+        # This catches both direct traversal AND symlinks pointing outside
         try:
             resolved.relative_to(_project_root)
         except ValueError:
-            raise ValueError(f"Path '{path}' is outside project directory")
+            raise ValueError(f"Path '{path}' resolves outside project directory")
+
+        # Additional symlink check: if the original path exists and is a symlink,
+        # verify the link target also stays within project bounds
+        original = _project_root / path if not target.is_absolute() else target
+        if original.is_symlink():
+            # Get the link target (may be relative to symlink location)
+            link_target = original.readlink()
+            if link_target.is_absolute():
+                # Absolute symlink - must resolve within project
+                if not str(link_target.resolve()).startswith(str(_project_root) + os.sep):
+                    raise ValueError(f"Path '{path}' is a symlink pointing outside project")
+            # Relative symlinks are checked via the resolved path above
 
         return resolved
     except ValueError:
@@ -289,15 +303,16 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
 
                 if not os.path.isfile(filepath):
                     continue
-                # Validate path is within project
+                # Validate path is within project and get validated path
                 try:
-                    _validate_path(filepath)
+                    validated_path = _validate_path(filepath)
                 except ValueError:
                     continue
 
                 try:
                     # Line-by-line search for memory efficiency
-                    with open(filepath, encoding="utf-8", errors="ignore") as f:
+                    # Use validated_path to prevent TOCTOU attacks
+                    with open(validated_path, encoding="utf-8", errors="ignore") as f:
                         for line_num, line in enumerate(f, 1):
                             if search_term in line:
                                 matches.append(f"{filepath}:{line_num}")

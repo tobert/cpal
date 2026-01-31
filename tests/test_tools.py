@@ -160,6 +160,32 @@ class TestPathValidation:
         with pytest.raises(ValueError, match="outside project"):
             _validate_path(f"{home}/.ssh/id_rsa")
 
+    def test_symlink_attack_blocked(self):
+        """Symlinks pointing outside project should be blocked."""
+        symlink_path = "./test_evil_symlink"
+        try:
+            # Create a symlink pointing to /etc/passwd
+            os.symlink("/etc/passwd", symlink_path)
+            # This should raise because the symlink resolves outside project
+            with pytest.raises(ValueError, match="outside project"):
+                _validate_path(symlink_path)
+        finally:
+            if os.path.islink(symlink_path):
+                os.unlink(symlink_path)
+
+    def test_symlink_within_project_allowed(self):
+        """Symlinks pointing within project should work."""
+        symlink_path = "./test_good_symlink"
+        try:
+            # Create a symlink pointing to a file within the project
+            os.symlink("pyproject.toml", symlink_path)
+            # This should work - symlink stays within project
+            result = _validate_path(symlink_path)
+            assert result.exists()
+        finally:
+            if os.path.islink(symlink_path):
+                os.unlink(symlink_path)
+
 
 class TestBinaryFileHandling:
     """Tests for binary file error handling."""
