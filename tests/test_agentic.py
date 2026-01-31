@@ -9,10 +9,18 @@ Requires: ANTHROPIC_API_KEY environment variable
 import os
 import sys
 
+import pytest
+
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from cpal.server import _consult
+
+# Skip if no API key available
+pytestmark = pytest.mark.skipif(
+    not os.getenv("ANTHROPIC_API_KEY"),
+    reason="ANTHROPIC_API_KEY not set"
+)
 
 
 def test_agentic_exploration():
