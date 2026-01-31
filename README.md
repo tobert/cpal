@@ -1,121 +1,80 @@
 # cpal - Claude Principal Assistant Layer
 
-An MCP server that brings the full power of Claude to any MCP client.
+An MCP server that lets any AI consult Claude.
 
-**The inverse of [gpal](https://github.com/tobert/gpal)** — where gpal lets Claude consult Gemini, cpal lets *anyone* consult Claude.
+**The inverse of [gpal](https://github.com/tobert/gpal)** — where gpal lets Claude consult Gemini, cpal lets Gemini (or any MCP client) consult Claude.
 
 ## Features
 
-- 🧠 **Three model tiers**: Haiku (fast), Sonnet (balanced), Opus (deep)
-- 💭 **Extended thinking**: Explicit chain-of-thought for complex problems
-- 🔧 **Autonomous exploration**: Claude can list, read, and search your codebase
-- 📸 **Vision support**: Analyze images and PDFs
-- 💬 **Stateful sessions**: Conversation history preserved across calls
+- 🧠 **Opus by default** — deep reasoning for hard problems (Sonnet/Haiku available)
+- 💭 **Extended thinking** — explicit chain-of-thought for complex analysis
+- 🔧 **Autonomous exploration** — Claude reads files and searches your codebase
+- 📸 **Vision** — analyze images and PDFs
+- 💬 **Stateful sessions** — conversation history preserved across calls
 
-## Installation
+## Install
 
 ```bash
-# From source
-git clone https://github.com/tobert/cpal
-cd cpal
-uv sync
+git clone https://github.com/tobert/cpal && cd cpal
+uv tool install -e .
 
-# Set your API key
-export ANTHROPIC_API_KEY="sk-ant-..."
+# Store API key securely
+mkdir -p ~/.config/cpal && chmod 700 ~/.config/cpal
+echo "sk-ant-..." > ~/.config/cpal/api_key && chmod 600 ~/.config/cpal/api_key
 ```
 
-## MCP Configuration
+## Configure
 
-Add to your MCP client config (e.g., `~/.cursor/mcp.json`):
+Add to your MCP client (`~/.gemini/settings.json`, `~/.cursor/mcp.json`, etc.):
 
 ```json
 {
   "mcpServers": {
     "cpal": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/cpal", "cpal"],
-      "env": {
-        "ANTHROPIC_API_KEY": "sk-ant-..."
-      }
+      "command": "cpal",
+      "args": ["--key-file", "~/.config/cpal/api_key"]
     }
   }
 }
 ```
 
+Falls back to `ANTHROPIC_API_KEY` env var if `--key-file` not specified.
+
 ## Usage
 
-### Quick consultation (Haiku)
-
 ```python
-consult_claude_haiku(
-    query="What does this function do?",
-    file_paths=["src/utils.py"]
-)
-```
+# Basic (uses Opus)
+consult_claude(query="Design a caching strategy for this API")
 
-### Code review (Sonnet)
-
-```python
-consult_claude_sonnet(
-    query="Review this PR for bugs and style issues",
+# With extended thinking
+consult_claude(
+    query="Review for subtle bugs",
     file_paths=["src/server.py"],
     extended_thinking=True
 )
+
+# Vision
+consult_claude(query="What's wrong with this UI?", media_paths=["screenshot.png"])
+
+# Different model
+consult_claude(query="Quick check", model="sonnet")  # or "haiku"
 ```
-
-### Deep analysis (Opus)
-
-```python
-consult_claude_opus(
-    query="Design a caching strategy for this API",
-    extended_thinking=True,
-    thinking_budget=50000
-)
-```
-
-### Vision analysis
-
-```python
-consult_claude_sonnet(
-    query="What's wrong with this UI?",
-    media_paths=["screenshot.png"]
-)
-```
-
-## Model Selection Guide
-
-| Use Case | Model | Extended Thinking |
-|----------|-------|-------------------|
-| Quick questions | Haiku | No |
-| Code review | Sonnet | Optional |
-| Debugging | Sonnet | Yes |
-| Architecture | Opus | Yes |
-| Hard problems | Opus | Yes |
 
 ## How It Works
 
 ```
-Your AI (Gemini, local model, etc.)
-        │
-        ▼ MCP Protocol
-┌───────────────────┐
-│   cpal Server     │
-│                   │
-│  Tools:           │
-│  • list_directory │
-│  • read_file      │
-│  • search_project │
-│                   │
-│  Agentic Loop     │
-└─────────┬─────────┘
-          ▼
-   Anthropic API
-          │
-          ▼
-      Claude
+MCP Client (Gemini, Cursor, etc.)
+         │
+         ▼ MCP
+    ┌─────────┐
+    │  cpal   │ ──▶ Anthropic API ──▶ Claude
+    └─────────┘
+         │
+    Claude autonomously uses tools:
+    • list_directory
+    • read_file
+    • search_project
 ```
-
-Claude runs autonomously within cpal, using tools to explore your codebase before responding.
 
 ## License
 
