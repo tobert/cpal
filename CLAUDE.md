@@ -160,12 +160,21 @@ consult_claude(query="...", model="opus", max_tool_calls=5)
 # Install dev dependencies first
 uv sync --all-extras
 
-# Unit tests (no API key needed)
+# Unit tests only (no API key needed, no cost)
 uv run pytest tests/test_tools.py -v
 
-# Manual integration tests (requires API key)
-uv run python tests/test_connectivity.py
-uv run python tests/test_agentic.py
+# All tests - integration tests auto-skip without API key
+uv run pytest tests/ -v
+```
+
+⚠️ **Cost warning**: If `ANTHROPIC_API_KEY` is set in your environment, `pytest tests/` will run integration tests that make real API calls. To avoid unexpected costs:
+
+```bash
+# Run only unit tests (always free)
+uv run pytest tests/test_tools.py -v
+
+# Or explicitly unset the key
+ANTHROPIC_API_KEY= uv run pytest tests/ -v
 ```
 
 ## Configuration

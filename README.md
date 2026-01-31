@@ -95,6 +95,15 @@ MCP Client (Gemini, Cursor, etc.)
     • search_project
 ```
 
+## Development
+
+```bash
+uv sync --all-extras
+uv run pytest tests/test_tools.py -v  # unit tests (free)
+```
+
+⚠️ Running `pytest tests/` with `ANTHROPIC_API_KEY` set will run integration tests that cost money. See [CLAUDE.md](CLAUDE.md) for details.
+
 ## License
 
 MIT
