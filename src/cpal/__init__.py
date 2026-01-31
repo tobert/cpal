@@ -1,5 +1,5 @@
 """
-cpal - Claude Principal Assistant Layer
+cpal - your pal Claude
 
 An MCP server providing stateful access to Claude models with
 extended thinking and autonomous codebase exploration.

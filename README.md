@@ -1,4 +1,4 @@
-# cpal - Claude Principal Assistant Layer
+# cpal - your pal Claude
 
 An MCP server that lets any AI consult Claude.
 

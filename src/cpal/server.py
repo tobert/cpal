@@ -1,5 +1,5 @@
 """
-cpal - Claude Principal Assistant Layer
+cpal - your pal Claude
 
 An MCP server providing stateful access to Claude models with
 extended thinking and autonomous codebase exploration capabilities.
@@ -702,7 +702,7 @@ def main() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        description="cpal - Claude Principal Assistant Layer MCP server"
+        description="cpal - your pal Claude MCP server"
     )
     parser.add_argument(
         "--key-file",
