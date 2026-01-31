@@ -143,6 +143,7 @@ sessions: dict[str, dict[str, Any]] = {}
 # Thread safety for concurrent session access
 _session_locks: dict[str, threading.Lock] = {}
 _locks_lock = threading.Lock()
+_sessions_lock = threading.Lock()  # Protects sessions dict structure
 
 # Logger
 logger = logging.getLogger("cpal")
@@ -157,7 +158,11 @@ def get_session_lock(session_id: str) -> threading.Lock:
 
 
 def cleanup_old_sessions() -> int:
-    """Remove sessions that haven't been accessed within SESSION_TTL. Returns count removed."""
+    """
+    Remove sessions that haven't been accessed within SESSION_TTL.
+
+    Returns count removed. Must be called with _sessions_lock held.
+    """
     now = time.time()
     to_remove = [
         sid for sid, sess in sessions.items()
@@ -269,14 +274,19 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
         search_term = input_data.get("search_term", "")
         glob_pattern = input_data.get("glob_pattern", "**/*")
         try:
-            files = globlib.glob(glob_pattern, recursive=True)
-            if len(files) > MAX_SEARCH_FILES:
-                return (
-                    f"Error: Too many files match '{glob_pattern}' ({len(files)}). "
-                    "Please use a more specific pattern."
-                )
+            # Use iglob iterator to avoid loading all paths into memory
+            files_iter = globlib.iglob(glob_pattern, recursive=True)
             matches = []
-            for filepath in files:
+            file_count = 0
+
+            for filepath in files_iter:
+                file_count += 1
+                if file_count > MAX_SEARCH_FILES:
+                    return (
+                        f"Error: Too many files match '{glob_pattern}' (>{MAX_SEARCH_FILES}). "
+                        "Please use a more specific pattern."
+                    )
+
                 if not os.path.isfile(filepath):
                     continue
                 # Validate path is within project
@@ -324,27 +334,28 @@ def get_session(session_id: str, model_alias: str) -> dict[str, Any]:
     """Get or create a session, migrating history when switching models."""
     target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
 
-    # Periodically cleanup old sessions (cheap check)
-    if len(sessions) > 100:
-        cleanup_old_sessions()
+    with _sessions_lock:
+        # Periodically cleanup old sessions (cheap check)
+        if len(sessions) > 100:
+            cleanup_old_sessions()
 
-    if session_id not in sessions:
-        sessions[session_id] = {
-            "messages": [],
-            "model": target_model,
-            "last_access": time.time(),
-        }
-        return sessions[session_id]
+        if session_id not in sessions:
+            sessions[session_id] = {
+                "messages": [],
+                "model": target_model,
+                "last_access": time.time(),
+            }
+            return sessions[session_id]
 
-    session = sessions[session_id]
-    session["last_access"] = time.time()
-    current_model = session.get("model")
+        session = sessions[session_id]
+        session["last_access"] = time.time()
+        current_model = session.get("model")
 
-    if current_model != target_model:
-        logging.info(f"Migrating session '{session_id}': {current_model} → {target_model}")
-        session["model"] = target_model
+        if current_model != target_model:
+            logger.info(f"Migrating session '{session_id}': {current_model} → {target_model}")
+            session["model"] = target_model
 
-    return session
+        return session
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -429,6 +440,16 @@ def build_content_blocks(
     return blocks
 
 
+def _filter_thinking_blocks(content: list) -> list:
+    """
+    Filter out thinking blocks from response content.
+
+    Anthropic API rejects thinking blocks in subsequent request history,
+    so we must remove them before adding to message history.
+    """
+    return [block for block in content if getattr(block, "type", None) != "thinking"]
+
+
 def run_agentic_loop(
     client: anthropic.Anthropic,
     model: str,
@@ -476,8 +497,8 @@ def run_agentic_loop(
                 elif block.type == "thinking":
                     thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
 
-            # Add final assistant response to history (preserving content blocks)
-            messages.append({"role": "assistant", "content": response.content})
+            # Add final assistant response to history (filter thinking blocks)
+            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content)})
 
             # Include thinking if present
             if thinking_parts:
@@ -488,8 +509,8 @@ def run_agentic_loop(
 
         # Handle tool use
         if response.stop_reason == "tool_use":
-            # Add assistant's response to messages
-            messages.append({"role": "assistant", "content": response.content})
+            # Add assistant's response to messages (filter thinking blocks)
+            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content)})
 
             # Process each tool call
             tool_results = []
@@ -520,7 +541,7 @@ def run_agentic_loop(
                 elif block.type == "thinking":
                     thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
 
-            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content)})
 
             if thinking_parts:
                 result = "\n\n".join(thinking_parts + text_parts)
@@ -537,7 +558,7 @@ def run_agentic_loop(
             elif block.type == "thinking":
                 thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
 
-        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content)})
 
         if thinking_parts:
             result = "\n\n".join(thinking_parts + text_parts)
@@ -584,18 +605,21 @@ def _consult(
         # Build the user message content
         content = build_content_blocks(query, file_paths, media_paths)
 
-        # Add to message history
-        session["messages"].append({"role": "user", "content": content})
+        # Build message history with new user message
+        # Pass a copy to prevent corruption if the loop crashes mid-execution
+        current_messages = list(session["messages"])
+        current_messages.append({"role": "user", "content": content})
 
         try:
             response_text, updated_messages = run_agentic_loop(
                 client,
                 model,
-                session["messages"],
+                current_messages,
                 extended_thinking=extended_thinking,
                 thinking_budget=thinking_budget,
                 max_tool_calls=max_tool_calls,
             )
+            # Only update session on success
             session["messages"] = updated_messages
 
             return response_text
