@@ -6,7 +6,7 @@ An MCP server that lets any AI consult Claude.
 
 ## Features
 
-- 🧠 **Sonnet by default** — balanced reasoning (Opus/Haiku available)
+- 🧠 **Opus by default** — deep reasoning (Sonnet/Haiku available)
 - 💭 **Extended thinking** — explicit chain-of-thought for complex analysis
 - 🔧 **Autonomous exploration** — Claude reads files and searches your codebase
 - 📸 **Vision** — analyze images and PDFs
@@ -57,7 +57,7 @@ Falls back to `ANTHROPIC_API_KEY` env var if `--key-file` not specified.
 ## Usage
 
 ```python
-# Basic (uses Sonnet)
+# Basic (uses Opus)
 consult_claude(query="Design a caching strategy for this API")
 
 # With extended thinking

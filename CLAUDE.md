@@ -10,8 +10,7 @@ Before committing changes to cpal, use cpal to review them:
 consult_claude(
     query="Review server.py for bugs, edge cases, and API misuse",
     file_paths=["src/cpal/server.py"],
-    model="sonnet",
-    extended_thinking=True
+    extended_thinking=True  # uses Opus by default
 )
 ```
 
@@ -82,7 +81,7 @@ cpal/
 One tool with a `model` parameter (not separate tools per model):
 
 ```python
-consult_claude(query="...", model="sonnet")  # default
+consult_claude(query="...", model="opus")    # default
 consult_claude(query="...", model="opus")    # deep reasoning
 consult_claude(query="...", model="haiku")   # fast & cheap
 ```
@@ -103,8 +102,8 @@ consult_claude(query="What about edge cases?", session_id="review-123")
 | Model | Alias | Best For |
 |-------|-------|----------|
 | `claude-haiku-4-5-20251001` | `haiku` | Fast exploration, quick questions |
-| `claude-sonnet-4-5-20250929` | `sonnet` | Balanced reasoning, code review (default) |
-| `claude-opus-4-5-20251101` | `opus` | Deep analysis, hard problems |
+| `claude-sonnet-4-5-20250929` | `sonnet` | Balanced reasoning, code review |
+| `claude-opus-4-5-20251101` | `opus` | Deep analysis, hard problems (default) |
 
 ### Extended Thinking
 

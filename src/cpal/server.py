@@ -656,7 +656,7 @@ def _consult(
 def consult_claude(
     query: str,
     session_id: str = "default",
-    model: str = "sonnet",
+    model: str = "opus",
     file_paths: list[str] | None = None,
     media_paths: list[str] | None = None,
     extended_thinking: bool = False,
@@ -673,7 +673,7 @@ def consult_claude(
     Args:
         query: The question or instruction.
         session_id: ID for conversation history (preserved across calls).
-        model: Model tier — "sonnet" (balanced, default), "opus" (deep reasoning), "haiku" (fast).
+        model: Model tier — "opus" (deep reasoning, default), "sonnet" (balanced), "haiku" (fast).
         file_paths: Text files to include as context.
         media_paths: Images (.png, .jpg, .webp, .gif) or PDFs for vision analysis.
         extended_thinking: Enable explicit chain-of-thought reasoning (Opus/Sonnet only).
