@@ -73,6 +73,10 @@ consult_claude(query="What's wrong with this UI?", media_paths=["screenshot.png"
 # Different models
 consult_claude(query="Hard problem", model="opus")   # deep reasoning
 consult_claude(query="Quick check", model="haiku")   # fast & cheap
+
+# Multi-turn conversation
+consult_claude(query="Explain the auth flow", session_id="review-123")
+consult_claude(query="What about edge cases?", session_id="review-123")  # continues
 ```
 
 ## How It Works

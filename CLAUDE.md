@@ -6,10 +6,11 @@ Internal documentation for cpal development.
 
 Before committing changes to cpal, use cpal to review them:
 
-```
-consult_claude_opus(
+```python
+consult_claude(
     query="Review server.py for bugs, edge cases, and API misuse",
     file_paths=["src/cpal/server.py"],
+    model="sonnet",
     extended_thinking=True
 )
 ```
@@ -19,33 +20,37 @@ consult_claude_opus(
 ```
 ┌─────────────────────────────────────────────────────┐
 │              MCP Client                             │
-│    (Gemini, Cursor, VS Code, local models, etc.)    │
+│    (Gemini, Cursor, Claude Code, local models)      │
 └─────────────────────┬───────────────────────────────┘
                       │ MCP Protocol
                       ▼
 ┌─────────────────────────────────────────────────────┐
 │                 cpal Server                         │
 │                                                     │
-│  ┌─────────────────┐  ┌─────────────────┐          │
-│  │ consult_haiku   │  │ consult_sonnet  │  ← Tools │
-│  └────────┬────────┘  └────────┬────────┘          │
-│           │    ┌───────────────┘                    │
-│           │    │  ┌─────────────────┐              │
-│           │    │  │ consult_opus    │              │
-│           │    │  └────────┬────────┘              │
-│           └────┴───────────┘                        │
-│                      │                              │
-│  ┌──────────────────────────────────────┐          │
-│  │       Session Manager                 │          │
-│  │  (history preservation, model switch) │          │
-│  └──────────────────┬───────────────────┘          │
-│                      │                              │
-│  ┌──────────────────────────────────────┐          │
-│  │       Agentic Tool Loop               │          │
-│  │  (Claude calls tools autonomously)    │          │
-│  └──────────────────┬───────────────────┘          │
-└──────────────────────┼──────────────────────────────┘
-                       ▼
+│  ┌──────────────────────────────────────────────┐  │
+│  │  consult_claude(model="haiku|sonnet|opus")   │  │
+│  └──────────────────────┬───────────────────────┘  │
+│                         │                          │
+│  ┌──────────────────────────────────────────────┐  │
+│  │  Session Manager                              │  │
+│  │  • Thread-safe with per-session locks         │  │
+│  │  • Auto-cleanup after 1 hour TTL              │  │
+│  │  • History migrates when switching models     │  │
+│  └──────────────────────┬───────────────────────┘  │
+│                         │                          │
+│  ┌──────────────────────────────────────────────┐  │
+│  │  Security Layer                               │  │
+│  │  • Path traversal protection                  │  │
+│  │  • Symlink attack prevention                  │  │
+│  │  • Project directory sandboxing               │  │
+│  └──────────────────────┬───────────────────────┘  │
+│                         │                          │
+│  ┌──────────────────────────────────────────────┐  │
+│  │  Agentic Tool Loop                            │  │
+│  │  (Claude calls tools autonomously)            │  │
+│  └──────────────────────┬───────────────────────┘  │
+└──────────────────────────┼──────────────────────────┘
+                           ▼
 ┌─────────────────────────────────────────────────────┐
 │              Anthropic API                          │
 │                                                     │
@@ -72,9 +77,24 @@ cpal/
 
 ## Key Design Decisions
 
+### Single Tool API
+
+One tool with a `model` parameter (not separate tools per model):
+
+```python
+consult_claude(query="...", model="sonnet")  # default
+consult_claude(query="...", model="opus")    # deep reasoning
+consult_claude(query="...", model="haiku")   # fast & cheap
+```
+
 ### Stateful Sessions
 
-Sessions live in memory (`sessions` dict). Same `session_id` = same conversation. History migrates when switching models.
+Sessions live in memory (`sessions` dict). Same `session_id` = same conversation.
+
+```python
+# Continue a conversation
+consult_claude(query="What about edge cases?", session_id="review-123")
+```
 
 ⚠️ **Limitation**: Sessions are not persisted. Server restart = fresh state.
 
@@ -83,7 +103,7 @@ Sessions live in memory (`sessions` dict). Same `session_id` = same conversation
 | Model | Alias | Best For |
 |-------|-------|----------|
 | `claude-haiku-4-5-20251001` | `haiku` | Fast exploration, quick questions |
-| `claude-sonnet-4-5-20250929` | `sonnet` | Balanced reasoning, code review |
+| `claude-sonnet-4-5-20250929` | `sonnet` | Balanced reasoning, code review (default) |
 | `claude-opus-4-5-20251101` | `opus` | Deep analysis, hard problems |
 
 ### Extended Thinking
@@ -91,25 +111,20 @@ Sessions live in memory (`sessions` dict). Same `session_id` = same conversation
 Sonnet and Opus support extended thinking - explicit chain-of-thought reasoning:
 
 ```python
-consult_claude_opus(
+consult_claude(
     query="Design a distributed cache system",
+    model="opus",
     extended_thinking=True,
     thinking_budget=50000  # tokens for reasoning
 )
 ```
 
-This produces deeper, more thorough analysis at the cost of latency.
+### Security
 
-### Agentic Tool Loop
-
-Unlike gpal (which uses Gemini's automatic function calling), cpal implements its own tool loop:
-
-1. Send message to Claude with tools available
-2. If Claude returns `tool_use`, execute the tools
-3. Send results back as `tool_result`
-4. Repeat until Claude returns `end_turn`
-
-This gives us full control over tool execution and allows for future enhancements.
+- **Path traversal protection**: All file operations validated against project root
+- **Symlink attack prevention**: Symlinks pointing outside project are blocked
+- **Thread safety**: Per-session locks prevent concurrent access corruption
+- **Session TTL**: Auto-cleanup after 1 hour of inactivity
 
 ### Safety Limits
 
@@ -119,8 +134,9 @@ This gives us full control over tool execution and allows for future enhancement
 | `MAX_INLINE_MEDIA` | 20 MB | Caps inline media size |
 | `MAX_SEARCH_FILES` | 1000 | Caps glob expansion |
 | `MAX_SEARCH_MATCHES` | 20 | Truncates search results |
+| `SESSION_TTL` | 1 hour | Auto-cleanup inactive sessions |
 
-### Tool Call Limits (per-call overridable)
+### Tool Call Limits
 
 Default limits are tier-specific but can be overridden per-call:
 
@@ -132,10 +148,10 @@ Default limits are tier-specific but can be overridden per-call:
 
 ```python
 # Let Haiku explore extensively
-consult_claude_haiku(query="...", max_tool_calls=100)
+consult_claude(query="...", model="haiku", max_tool_calls=100)
 
 # Constrain Opus to save costs
-consult_claude_opus(query="...", max_tool_calls=5)
+consult_claude(query="...", model="opus", max_tool_calls=5)
 ```
 
 ## Testing
@@ -147,17 +163,18 @@ uv sync --all-extras
 # Unit tests (no API key needed)
 uv run pytest tests/test_tools.py -v
 
-# Manual integration tests (requires ANTHROPIC_API_KEY)
-export ANTHROPIC_API_KEY="..."
+# Manual integration tests (requires API key)
 uv run python tests/test_connectivity.py
 uv run python tests/test_agentic.py
 ```
 
-## Environment Variables
+## Configuration
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `ANTHROPIC_API_KEY` | Yes | Anthropic API key |
+| Option | Description |
+|--------|-------------|
+| `--key-file PATH` | Read API key from file (recommended) |
+| `--debug` | Enable debug logging |
+| `ANTHROPIC_API_KEY` | Fallback if `--key-file` not specified |
 
 ## Differences from gpal
 
