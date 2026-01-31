@@ -7,10 +7,12 @@ extended thinking and autonomous codebase exploration capabilities.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import glob as globlib
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,9 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 load_dotenv()
+
+# Module-level API key (set via --key-file or environment)
+_api_key: str | None = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -213,10 +218,12 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
 
 
 def get_client() -> anthropic.Anthropic:
-    """Create an Anthropic API client from environment variables."""
-    api_key = os.getenv("ANTHROPIC_API_KEY")
+    """Create an Anthropic API client from key file or environment."""
+    api_key = _api_key or os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY not set.")
+        raise ValueError(
+            "No API key found. Use --key-file or set ANTHROPIC_API_KEY."
+        )
     return anthropic.Anthropic(api_key=api_key)
 
 
@@ -452,37 +459,10 @@ def _consult(
 
 
 @mcp.tool()
-def consult_claude_haiku(
+def consult_claude(
     query: str,
     session_id: str = "default",
-    file_paths: list[str] | None = None,
-    media_paths: list[str] | None = None,
-    max_tool_calls: int | None = None,
-) -> str:
-    """
-    Consults Claude Haiku 4.5 (Fast/Efficient). Context window of 200K tokens.
-
-    Claude has tools to list directories, read files, and search the project
-    autonomously. You do not need to provide all file contents.
-
-    BEST FOR: Quick exploration, simple questions, fast iteration. Cheap enough
-    to let it rip through many tool calls.
-
-    Args:
-        query: The question or instruction.
-        session_id: ID for conversation history. Shared across model tiers.
-        file_paths: Text files to include as context.
-        media_paths: Images (.png, .jpg, .webp, .gif) or PDFs for vision analysis.
-        max_tool_calls: Max autonomous tool calls (default 50 for Haiku).
-    """
-    return _consult(query, session_id, "haiku", file_paths, media_paths,
-                    max_tool_calls=max_tool_calls)
-
-
-@mcp.tool()
-def consult_claude_sonnet(
-    query: str,
-    session_id: str = "default",
+    model: str = "opus",
     file_paths: list[str] | None = None,
     media_paths: list[str] | None = None,
     extended_thinking: bool = False,
@@ -490,58 +470,24 @@ def consult_claude_sonnet(
     max_tool_calls: int | None = None,
 ) -> str:
     """
-    Consults Claude Sonnet 4.5 (Balanced). Context window of 200K tokens.
+    Consult Claude for deep reasoning and analysis. Context window of 200K tokens.
 
     Claude has tools to list directories, read files, and search the project
-    autonomously. Encourage it to read whole files and provide holistic feedback.
-
-    BEST FOR: Code review, debugging, balanced speed/quality tasks.
+    autonomously. You do not need to provide all file contents — Claude will
+    explore the codebase to gather context before responding.
 
     Args:
         query: The question or instruction.
-        session_id: ID for conversation history. Shared across model tiers.
+        session_id: ID for conversation history (preserved across calls).
+        model: Model tier — "opus" (deep reasoning, default), "sonnet" (balanced), "haiku" (fast).
         file_paths: Text files to include as context.
         media_paths: Images (.png, .jpg, .webp, .gif) or PDFs for vision analysis.
-        extended_thinking: Enable explicit chain-of-thought reasoning (slower but deeper).
+        extended_thinking: Enable explicit chain-of-thought reasoning (Opus/Sonnet only).
         thinking_budget: Max tokens for thinking (default 10000, max ~100000).
-        max_tool_calls: Max autonomous tool calls (default 25 for Sonnet).
+        max_tool_calls: Max autonomous tool calls (default varies by model).
     """
     return _consult(
-        query, session_id, "sonnet", file_paths, media_paths,
-        extended_thinking, thinking_budget, max_tool_calls
-    )
-
-
-@mcp.tool()
-def consult_claude_opus(
-    query: str,
-    session_id: str = "default",
-    file_paths: list[str] | None = None,
-    media_paths: list[str] | None = None,
-    extended_thinking: bool = False,
-    thinking_budget: int = 10000,
-    max_tool_calls: int | None = None,
-) -> str:
-    """
-    Consults Claude Opus 4.5 (Deep Reasoning). Context window of 200K tokens.
-
-    Claude has tools to list directories, read files, and search the project
-    autonomously. Use for the hardest problems requiring deep analysis.
-
-    BEST FOR: Complex architecture, hard bugs, philosophical questions, synthesis.
-    Default tool limit is conservative (10) since Opus is expensive.
-
-    Args:
-        query: The question or instruction.
-        session_id: ID for conversation history. Shared across model tiers.
-        file_paths: Text files to include as context.
-        media_paths: Images (.png, .jpg, .webp, .gif) or PDFs for vision analysis.
-        extended_thinking: Enable explicit chain-of-thought reasoning (slower but deeper).
-        thinking_budget: Max tokens for thinking (default 10000, max ~100000).
-        max_tool_calls: Max autonomous tool calls (default 10 for Opus - override if needed).
-    """
-    return _consult(
-        query, session_id, "opus", file_paths, media_paths,
+        query, session_id, model, file_paths, media_paths,
         extended_thinking, thinking_budget, max_tool_calls
     )
 
@@ -552,6 +498,24 @@ def consult_claude_opus(
 
 
 def main() -> None:
+    global _api_key
+
+    parser = argparse.ArgumentParser(
+        description="cpal - Claude Principal Assistant Layer MCP server"
+    )
+    parser.add_argument(
+        "--key-file",
+        type=Path,
+        help="Path to file containing Anthropic API key (alternative to ANTHROPIC_API_KEY env)",
+    )
+    args = parser.parse_args()
+
+    if args.key_file:
+        if not args.key_file.exists():
+            print(f"Error: Key file not found: {args.key_file}", file=sys.stderr)
+            sys.exit(1)
+        _api_key = args.key_file.read_text().strip()
+
     mcp.run()
 
 
