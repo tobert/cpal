@@ -6,7 +6,7 @@ An MCP server that lets any AI consult Claude.
 
 ## Features
 
-- 🧠 **Opus by default** — deep reasoning for hard problems (Sonnet/Haiku available)
+- 🧠 **Sonnet by default** — balanced reasoning (Opus/Haiku available)
 - 💭 **Extended thinking** — explicit chain-of-thought for complex analysis
 - 🔧 **Autonomous exploration** — Claude reads files and searches your codebase
 - 📸 **Vision** — analyze images and PDFs
@@ -25,7 +25,21 @@ echo "sk-ant-..." > ~/.config/cpal/api_key && chmod 600 ~/.config/cpal/api_key
 
 ## Configure
 
-Add to your MCP client (`~/.gemini/settings.json`, `~/.cursor/mcp.json`, etc.):
+### Gemini CLI
+
+```bash
+gemini mcp add cpal --scope user -- cpal --key-file ~/.config/cpal/api_key
+```
+
+### Claude Code
+
+```bash
+claude mcp add cpal --scope user -- cpal --key-file ~/.config/cpal/api_key
+```
+
+### Manual (Cursor, etc.)
+
+Add to your MCP config (`~/.cursor/mcp.json`, etc.):
 
 ```json
 {
@@ -43,7 +57,7 @@ Falls back to `ANTHROPIC_API_KEY` env var if `--key-file` not specified.
 ## Usage
 
 ```python
-# Basic (uses Opus)
+# Basic (uses Sonnet)
 consult_claude(query="Design a caching strategy for this API")
 
 # With extended thinking
@@ -56,8 +70,9 @@ consult_claude(
 # Vision
 consult_claude(query="What's wrong with this UI?", media_paths=["screenshot.png"])
 
-# Different model
-consult_claude(query="Quick check", model="sonnet")  # or "haiku"
+# Different models
+consult_claude(query="Hard problem", model="opus")   # deep reasoning
+consult_claude(query="Quick check", model="haiku")   # fast & cheap
 ```
 
 ## How It Works
