@@ -17,10 +17,19 @@ An MCP server that lets any AI consult Claude.
 ```bash
 git clone https://github.com/tobert/cpal && cd cpal
 uv tool install -e .
+```
 
-# Store API key securely
+### API Key (choose one)
+
+**Option A: Key file (recommended)**
+```bash
 mkdir -p ~/.config/cpal && chmod 700 ~/.config/cpal
 echo "sk-ant-..." > ~/.config/cpal/api_key && chmod 600 ~/.config/cpal/api_key
+```
+
+**Option B: Environment variable**
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
 ## Configure
@@ -52,7 +61,18 @@ Add to your MCP config (`~/.cursor/mcp.json`, etc.):
 }
 ```
 
-Falls back to `ANTHROPIC_API_KEY` env var if `--key-file` not specified.
+Or with env var:
+
+```json
+{
+  "mcpServers": {
+    "cpal": {
+      "command": "cpal",
+      "env": { "ANTHROPIC_API_KEY": "sk-ant-..." }
+    }
+  }
+}
+```
 
 ## Usage
 
