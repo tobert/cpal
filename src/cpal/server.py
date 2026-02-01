@@ -38,11 +38,11 @@ MAX_INLINE_MEDIA = 20 * 1024 * 1024  # 20 MB - inline media limit
 MAX_SEARCH_FILES = 1000
 MAX_SEARCH_MATCHES = 20
 SESSION_TTL = 3600  # 1 hour - sessions expire after this
-# Default tool call limits per model tier (can be overridden per-call)
+# Default tool call limits (can be overridden per-call)
 DEFAULT_TOOL_CALLS = {
-    "haiku": 50,   # Cheap and fast - let it rip
-    "sonnet": 25,  # Balanced
-    "opus": 10,    # Expensive - chill out
+    "haiku": 1000,
+    "sonnet": 1000,
+    "opus": 1000,
 }
 
 MODEL_ALIASES: dict[str, str] = {
@@ -617,7 +617,7 @@ def _consult(
 
         # Use tier-specific default if not specified
         if max_tool_calls is None:
-            max_tool_calls = DEFAULT_TOOL_CALLS.get(model_alias.lower(), 25)
+            max_tool_calls = DEFAULT_TOOL_CALLS.get(model_alias.lower(), 1000)
 
         # Build the user message content
         content = build_content_blocks(query, file_paths, media_paths)
@@ -666,19 +666,32 @@ def consult_claude(
     max_tool_calls: int | None = None,
 ) -> str:
     """
-    Consult Claude for deep reasoning and analysis. Context window of 200K tokens.
+    Consult Claude for logical precision, planning, and focused analysis.
 
-    Claude has tools to list directories, read files, and search the project
-    autonomously. You do not need to provide all file contents — Claude will
-    explore the codebase to gather context before responding.
+    Best for:
+    - **Second opinions**: Validate high-stakes logic, security-sensitive code, or
+      architectural decisions before committing.
+    - **Planning**: Break down complex tasks into concrete steps. Claude excels at
+      methodical decomposition where the path forward isn't obvious.
+    - **Adversarial review**: Ask Claude to find flaws in your proposed plan—a
+      skeptical peer who follows instructions stubbornly.
+    - **Deep debugging**: When you've tried the obvious fix and it's still failing,
+      a different perspective may spot what you missed.
+
+    Claude autonomously explores the codebase (list dirs, read files, search) to
+    gather context—you don't need to provide all file contents upfront.
+
+    For analytical tasks, enable `extended_thinking=True` to get explicit
+    chain-of-thought reasoning (root cause analysis, architectural trade-offs,
+    refactoring legacy code where the "why" needs unpacking).
 
     Args:
         query: The question or instruction.
         session_id: ID for conversation history (preserved across calls).
-        model: Model tier — "opus" (deep reasoning, default), "sonnet" (balanced), "haiku" (fast).
+        model: "opus" (default, precise), "sonnet" (fast), or "haiku" (quick scans/summaries).
         file_paths: Text files to include as context.
         media_paths: Images (.png, .jpg, .webp, .gif) or PDFs for vision analysis.
-        extended_thinking: Enable explicit chain-of-thought reasoning (Opus/Sonnet only).
+        extended_thinking: Enable chain-of-thought reasoning (recommended for analysis).
         thinking_budget: Max tokens for thinking (default 10000, max ~100000).
         max_tool_calls: Max autonomous tool calls (default varies by model).
     """
