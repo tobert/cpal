@@ -115,6 +115,19 @@ MCP Client (Gemini, Cursor, etc.)
     • search_project
 ```
 
+## Security
+
+- Restricted to project directory
+- Validates file reads
+- Session isolation
+- File size limits: 10MB text, 20MB media
+
+## Notes
+
+- **Sessions are in-memory** — history is lost when the server restarts.
+- **Models cost money** — Opus is the default; use `haiku` or `sonnet` for lower costs.
+- **Vision** — Supports PNG, JPEG, GIF, WebP, and PDF (max 20MB).
+
 ## Development
 
 ```bash
