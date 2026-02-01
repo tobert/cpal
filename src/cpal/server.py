@@ -22,6 +22,8 @@ import anthropic
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
+from cpal import __version__
+
 load_dotenv()
 
 # Module-level API key (set via --key-file or environment)
@@ -685,6 +687,128 @@ def consult_claude(
         query, session_id, model, file_paths, media_paths,
         extended_thinking, thinking_budget, max_tool_calls
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MCP Resources (read-only introspection)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@mcp.resource("resource://server/info")
+def server_info() -> dict[str, Any]:
+    """Server version, capabilities, and status."""
+    return {
+        "name": "cpal",
+        "version": __version__,
+        "description": "your pal Claude - MCP server for Claude consultation",
+        "default_model": "opus",
+        "supported_models": ["opus", "sonnet", "haiku"],
+        "features": ["extended_thinking", "vision", "stateful_sessions"],
+    }
+
+
+@mcp.resource("resource://models")
+def list_models() -> dict[str, Any]:
+    """Available Claude models and their characteristics."""
+    return {
+        "default": "opus",
+        "models": {
+            "opus": {
+                "id": MODEL_ALIASES["opus"],
+                "description": "Deep reasoning, hard problems",
+                "default_tool_calls": DEFAULT_TOOL_CALLS["opus"],
+                "extended_thinking": True,
+            },
+            "sonnet": {
+                "id": MODEL_ALIASES["sonnet"],
+                "description": "Balanced reasoning, code review",
+                "default_tool_calls": DEFAULT_TOOL_CALLS["sonnet"],
+                "extended_thinking": True,
+            },
+            "haiku": {
+                "id": MODEL_ALIASES["haiku"],
+                "description": "Fast exploration, quick questions",
+                "default_tool_calls": DEFAULT_TOOL_CALLS["haiku"],
+                "extended_thinking": False,
+            },
+        },
+    }
+
+
+@mcp.resource("resource://config/limits")
+def get_limits() -> dict[str, Any]:
+    """Safety limits and configuration."""
+    return {
+        "max_file_size_bytes": MAX_FILE_SIZE,
+        "max_inline_media_bytes": MAX_INLINE_MEDIA,
+        "max_search_files": MAX_SEARCH_FILES,
+        "max_search_matches": MAX_SEARCH_MATCHES,
+        "session_ttl_seconds": SESSION_TTL,
+        "thinking_budget_range": [1000, 100000],
+    }
+
+
+@mcp.resource("resource://sessions")
+def list_sessions() -> dict[str, Any]:
+    """List all active sessions."""
+    with _sessions_lock:
+        return {
+            "count": len(sessions),
+            "sessions": [
+                {
+                    "id": sid,
+                    "model": sess["model"],
+                    "message_count": len(sess["messages"]),
+                    "last_access": sess.get("last_access", 0),
+                }
+                for sid, sess in sessions.items()
+            ],
+        }
+
+
+@mcp.resource("resource://session/{session_id}")
+def get_session_resource(session_id: str) -> dict[str, Any]:
+    """Get details for a specific session."""
+    with _sessions_lock:
+        if session_id not in sessions:
+            return {"error": f"Session '{session_id}' not found"}
+        sess = sessions[session_id]
+        return {
+            "id": session_id,
+            "model": sess["model"],
+            "message_count": len(sess["messages"]),
+            "last_access": sess.get("last_access", 0),
+            "messages_preview": [
+                {"role": m["role"], "length": len(str(m["content"]))}
+                for m in sess["messages"][-5:]  # last 5 messages
+            ],
+        }
+
+
+@mcp.resource("resource://tools/internal")
+def internal_tools() -> dict[str, Any]:
+    """Tools available to Claude for autonomous exploration."""
+    return {
+        "tools": [
+            {
+                "name": "list_directory",
+                "description": "List files and directories at a path",
+            },
+            {
+                "name": "read_file",
+                "description": "Read file content (max 10MB, text only)",
+            },
+            {
+                "name": "search_project",
+                "description": "Search for text in files matching glob pattern",
+            },
+        ],
+        "security": {
+            "path_validation": True,
+            "symlink_protection": True,
+            "project_sandboxed": True,
+        },
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
