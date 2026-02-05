@@ -14,7 +14,7 @@ import pytest
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from cpal.server import get_client, MODEL_ALIASES
+from cpal.server import get_client, get_model_aliases
 
 # Skip if no API key available
 pytestmark = pytest.mark.skipif(
@@ -29,7 +29,7 @@ def test_connectivity():
 
     print("Testing Claude API connectivity...\n")
 
-    for alias, model in MODEL_ALIASES.items():
+    for alias, model in get_model_aliases().items():
         print(f"Testing {alias} ({model})...")
         try:
             response = client.messages.create(

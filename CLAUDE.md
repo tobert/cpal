@@ -99,11 +99,16 @@ consult_claude(query="What about edge cases?", session_id="review-123")
 
 ### Model Strategy
 
-| Model | Alias | Best For |
-|-------|-------|----------|
-| `claude-haiku-4-5-20251001` | `haiku` | Fast exploration, quick questions |
-| `claude-sonnet-4-5-20250929` | `sonnet` | Balanced reasoning, code review |
-| `claude-opus-4-5-20251101` | `opus` | Deep analysis, hard problems (default) |
+Models are discovered automatically from the Anthropic API on first use,
+picking the newest version per tier by `created_at`. Hardcoded fallbacks
+are used when the API is unreachable. Fallback results are **not cached**,
+so the next call retries discovery.
+
+| Tier | Fallback ID | Best For |
+|------|-------------|----------|
+| `haiku` | `claude-haiku-4-5-20251001` | Fast exploration, quick questions |
+| `sonnet` | `claude-sonnet-4-5-20250929` | Balanced reasoning, code review |
+| `opus` | `claude-opus-4-5-20251101` | Deep analysis, hard problems (default) |
 
 ### Extended Thinking
 
@@ -152,6 +157,19 @@ consult_claude(query="...", model="haiku", max_tool_calls=100)
 # Constrain Opus to save costs
 consult_claude(query="...", model="opus", max_tool_calls=5)
 ```
+
+## Installing
+
+```bash
+# Full rebuild from source — use --reinstall to bust uv's wheel cache
+uv tool install --force --reinstall /path/to/cpal
+
+# Then reconnect in Claude Code
+/mcp
+```
+
+⚠️ `uv tool install --force` alone may reuse a cached wheel and skip source changes.
+Always add `--reinstall` when iterating on local code.
 
 ## Testing
 

@@ -45,11 +45,70 @@ DEFAULT_TOOL_CALLS = {
     "opus": 1000,
 }
 
-MODEL_ALIASES: dict[str, str] = {
+FALLBACK_ALIASES: dict[str, str] = {
     "haiku": "claude-haiku-4-5-20251001",    # Haiku 4.5
     "sonnet": "claude-sonnet-4-5-20250929",  # Sonnet 4.5
     "opus": "claude-opus-4-5-20251101",      # Opus 4.5
 }
+
+# Known tiers we care about
+KNOWN_TIERS = {"haiku", "sonnet", "opus"}
+
+# Lazy-init cache for discovered models
+_discovered_models: dict[str, str] | None = None
+_models_lock = threading.Lock()
+
+
+def _fetch_latest_models() -> dict[str, str] | None:
+    """Fetch latest model versions from Anthropic API.
+
+    Matches model IDs by substring (e.g. 'claude-opus' in ID),
+    picks the newest per tier by created_at datetime.
+    Returns None on failure so callers can distinguish fallback from discovery.
+    """
+    try:
+        client = get_client()
+        response = client.models.list(limit=1000)
+
+        latest: dict[str, tuple[Any, str]] = {}  # tier → (created_at, model_id)
+
+        for model in response:  # auto-paginates
+            for tier in KNOWN_TIERS:
+                if f"claude-{tier}" in model.id:
+                    if tier not in latest or model.created_at > latest[tier][0]:
+                        latest[tier] = (model.created_at, model.id)
+                    break
+
+        if latest:
+            result = {tier: model_id for tier, (_, model_id) in latest.items()}
+            logger.info(f"Discovered models: {result}")
+            return result
+
+        logger.warning("No models matched known tiers")
+        return None
+    except Exception as e:
+        logger.warning(f"Model discovery failed: {e}")
+        return None
+
+
+def get_model_aliases() -> dict[str, str]:
+    """Get model aliases, fetching from API on first call.
+
+    Thread-safe with double-checked locking. Only caches successful
+    discovery — fallback results are never cached so the next call
+    retries the API.
+    """
+    global _discovered_models
+    if _discovered_models is not None:
+        return _discovered_models
+    with _models_lock:
+        if _discovered_models is not None:
+            return _discovered_models
+        result = _fetch_latest_models()
+        if result is not None:
+            _discovered_models = result
+            return _discovered_models
+        return FALLBACK_ALIASES.copy()
 
 # MIME type mappings for multimodal support
 MIME_TYPES: dict[str, str] = {
@@ -349,7 +408,7 @@ def get_client() -> anthropic.Anthropic:
 
 def get_session(session_id: str, model_alias: str) -> dict[str, Any]:
     """Get or create a session, migrating history when switching models."""
-    target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
+    target_model = get_model_aliases().get(model_alias.lower(), model_alias)
 
     with _sessions_lock:
         # Periodically cleanup old sessions (cheap check)
@@ -490,7 +549,7 @@ def run_agentic_loop(
     }
 
     # Add extended thinking if requested (only for supported models)
-    if extended_thinking and model in (MODEL_ALIASES["sonnet"], MODEL_ALIASES["opus"]):
+    if extended_thinking and model in (get_model_aliases().get("sonnet"), get_model_aliases().get("opus")):
         kwargs["thinking"] = {
             "type": "enabled",
             "budget_tokens": thinking_budget,
@@ -702,6 +761,32 @@ def consult_claude(
     )
 
 
+@mcp.tool()
+def list_models() -> dict[str, Any]:
+    """List available Claude models.
+
+    Returns model aliases (haiku, sonnet, opus) mapped to their
+    current versioned model IDs, with metadata about each tier.
+    """
+    aliases = get_model_aliases()
+    return {
+        "default": "opus",
+        "models": {
+            alias: {
+                "id": model_id,
+                "description": {
+                    "haiku": "Fast exploration, quick questions",
+                    "sonnet": "Balanced reasoning, code review",
+                    "opus": "Deep reasoning, hard problems",
+                }.get(alias, ""),
+                "extended_thinking": alias in ("sonnet", "opus"),
+                "default_tool_calls": DEFAULT_TOOL_CALLS.get(alias, 1000),
+            }
+            for alias, model_id in aliases.items()
+        },
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MCP Resources (read-only introspection)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -721,25 +806,26 @@ def server_info() -> dict[str, Any]:
 
 
 @mcp.resource("resource://models")
-def list_models() -> dict[str, Any]:
+def models_resource() -> dict[str, Any]:
     """Available Claude models and their characteristics."""
+    aliases = get_model_aliases()
     return {
         "default": "opus",
         "models": {
             "opus": {
-                "id": MODEL_ALIASES["opus"],
+                "id": aliases["opus"],
                 "description": "Deep reasoning, hard problems",
                 "default_tool_calls": DEFAULT_TOOL_CALLS["opus"],
                 "extended_thinking": True,
             },
             "sonnet": {
-                "id": MODEL_ALIASES["sonnet"],
+                "id": aliases["sonnet"],
                 "description": "Balanced reasoning, code review",
                 "default_tool_calls": DEFAULT_TOOL_CALLS["sonnet"],
                 "extended_thinking": True,
             },
             "haiku": {
-                "id": MODEL_ALIASES["haiku"],
+                "id": aliases["haiku"],
                 "description": "Fast exploration, quick questions",
                 "default_tool_calls": DEFAULT_TOOL_CALLS["haiku"],
                 "extended_thinking": False,

@@ -19,6 +19,7 @@ from cpal.server import (
     sessions,
     cleanup_old_sessions,
     SESSION_TTL,
+    FALLBACK_ALIASES,
 )
 
 
@@ -263,3 +264,52 @@ class TestSearchWithLineNumbers:
                 assert ":2" in result or "No matches" in result
             finally:
                 os.unlink(f.name)
+
+
+class TestModelDiscovery:
+    """Tests for dynamic model discovery."""
+
+    def test_fetch_returns_none_when_no_api_key(self, monkeypatch):
+        """_fetch_latest_models returns None when API unavailable."""
+        import cpal.server as srv
+        monkeypatch.setattr(srv, "_api_key", None)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setattr(srv, "_discovered_models", None)
+
+        assert srv._fetch_latest_models() is None
+
+    def test_get_aliases_falls_back_when_no_api_key(self, monkeypatch):
+        """get_model_aliases returns fallbacks when discovery fails."""
+        import cpal.server as srv
+        monkeypatch.setattr(srv, "_api_key", None)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setattr(srv, "_discovered_models", None)
+
+        result = srv.get_model_aliases()
+        assert "opus" in result
+        assert "sonnet" in result
+        assert "haiku" in result
+
+    def test_fallback_not_cached(self, monkeypatch):
+        """Fallback results are not cached, so next call retries."""
+        import cpal.server as srv
+        monkeypatch.setattr(srv, "_api_key", None)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setattr(srv, "_discovered_models", None)
+
+        srv.get_model_aliases()
+        assert srv._discovered_models is None
+
+    def test_get_model_aliases_caches(self, monkeypatch):
+        """Second call returns cached result without re-fetching."""
+        import cpal.server as srv
+        monkeypatch.setattr(srv, "_discovered_models", {"opus": "test-model"})
+
+        result = srv.get_model_aliases()
+        assert result == {"opus": "test-model"}
+
+    def test_fallback_aliases_are_valid(self):
+        """Fallback aliases follow expected naming pattern."""
+        for tier, model_id in FALLBACK_ALIASES.items():
+            assert tier in ("haiku", "sonnet", "opus")
+            assert model_id.startswith(f"claude-{tier}")
