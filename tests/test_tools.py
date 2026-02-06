@@ -16,7 +16,11 @@ from cpal.server import (
     detect_mime_type,
     is_text_file,
     _validate_path,
+    _filter_thinking_blocks,
+    _consult,
     sessions,
+    _session_locks,
+    get_session_lock,
     cleanup_old_sessions,
     SESSION_TTL,
     FALLBACK_ALIASES,
@@ -122,13 +126,17 @@ class TestBuildContentBlocks:
         assert blocks[0]["text"] == "Hello"
 
     def test_with_file(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, dir="."
+        ) as f:
             f.write("file content")
             f.flush()
-            blocks = build_content_blocks("Query", file_paths=[f.name])
-            assert len(blocks) == 2
-            assert "file content" in blocks[0]["text"]
-            os.unlink(f.name)
+            try:
+                blocks = build_content_blocks("Query", file_paths=[f.name])
+                assert len(blocks) == 2
+                assert "file content" in blocks[0]["text"]
+            finally:
+                os.unlink(f.name)
 
 
 class TestPathValidation:
@@ -273,6 +281,7 @@ class TestModelDiscovery:
         """_fetch_latest_models returns None when API unavailable."""
         import cpal.server as srv
         monkeypatch.setattr(srv, "_api_key", None)
+        monkeypatch.setattr(srv, "_client", None)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setattr(srv, "_discovered_models", None)
 
@@ -282,6 +291,7 @@ class TestModelDiscovery:
         """get_model_aliases returns fallbacks when discovery fails."""
         import cpal.server as srv
         monkeypatch.setattr(srv, "_api_key", None)
+        monkeypatch.setattr(srv, "_client", None)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setattr(srv, "_discovered_models", None)
 
@@ -294,6 +304,7 @@ class TestModelDiscovery:
         """Fallback results are not cached, so next call retries."""
         import cpal.server as srv
         monkeypatch.setattr(srv, "_api_key", None)
+        monkeypatch.setattr(srv, "_client", None)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setattr(srv, "_discovered_models", None)
 
@@ -313,3 +324,91 @@ class TestModelDiscovery:
         for tier, model_id in FALLBACK_ALIASES.items():
             assert tier in ("haiku", "sonnet", "opus")
             assert model_id.startswith(f"claude-{tier}")
+
+
+class TestCleanupPreservesLocks:
+    """Tests that session cleanup doesn't delete locks held by other threads."""
+
+    def test_cleanup_preserves_locks(self):
+        """Lock objects should survive cleanup of their session."""
+        import time as time_module
+
+        test_sid = "_test_lock_survival_"
+        sessions[test_sid] = {
+            "messages": [],
+            "model": "test",
+            "last_access": time_module.time() - SESSION_TTL - 100,
+        }
+        # Grab the lock before cleanup
+        lock_before = get_session_lock(test_sid)
+
+        try:
+            cleanup_old_sessions()
+            # Session should be gone
+            assert test_sid not in sessions
+            # But the lock should still be the same object
+            lock_after = get_session_lock(test_sid)
+            assert lock_before is lock_after
+        finally:
+            sessions.pop(test_sid, None)
+
+
+class TestPathTraversalInConsult:
+    """Tests that _consult blocks path traversal via file_paths/media_paths."""
+
+    def test_file_path_traversal_blocked(self):
+        """file_paths pointing outside project should be rejected."""
+        result = _consult(
+            query="test",
+            session_id="test-traversal",
+            model_alias="opus",
+            file_paths=["/etc/passwd"],
+        )
+        assert "Error" in result
+        assert "outside project" in result
+
+    def test_media_path_traversal_blocked(self):
+        """media_paths pointing outside project should be rejected."""
+        result = _consult(
+            query="test",
+            session_id="test-traversal-media",
+            model_alias="opus",
+            media_paths=["/etc/passwd"],
+        )
+        assert "Error" in result
+        assert "outside project" in result
+
+
+class TestFilterThinkingBlocks:
+    """Tests for _filter_thinking_blocks conditional behavior."""
+
+    def _make_block(self, block_type: str, text: str = "hello"):
+        """Create a mock block with a type attribute."""
+        class MockBlock:
+            pass
+        b = MockBlock()
+        b.type = block_type
+        b.text = text
+        return b
+
+    def test_strips_when_disabled(self):
+        """Thinking blocks should be stripped when thinking is disabled."""
+        blocks = [
+            self._make_block("thinking"),
+            self._make_block("text"),
+        ]
+        result = _filter_thinking_blocks(blocks, thinking_enabled=False)
+        assert len(result) == 1
+        assert result[0].type == "text"
+
+    def test_preserves_when_enabled(self):
+        """Thinking blocks should be preserved when thinking is enabled."""
+        blocks = [
+            self._make_block("thinking"),
+            self._make_block("text"),
+        ]
+        result = _filter_thinking_blocks(blocks, thinking_enabled=True)
+        assert len(result) == 2
+        types = [b.type for b in result]
+        assert "thinking" in types
+        assert "text" in types

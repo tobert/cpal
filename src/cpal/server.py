@@ -29,6 +29,10 @@ load_dotenv()
 # Module-level API key (set via --key-file or environment)
 _api_key: str | None = None
 
+# Cached Anthropic client (thread-safe lazy init)
+_client: anthropic.Anthropic | None = None
+_client_lock = threading.Lock()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -245,9 +249,7 @@ def cleanup_old_sessions() -> int:
     ]
     for sid in to_remove:
         del sessions[sid]
-        with _locks_lock:
-            if sid in _session_locks:
-                del _session_locks[sid]
+        # Don't delete from _session_locks — another thread may hold the lock
     return len(to_remove)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -349,8 +351,9 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
         search_term = input_data.get("search_term", "")
         glob_pattern = input_data.get("glob_pattern", "**/*")
         try:
-            # Use iglob iterator to avoid loading all paths into memory
-            files_iter = globlib.iglob(glob_pattern, recursive=True)
+            # Anchor glob to project root (not CWD)
+            root = _validate_path(".")
+            files_iter = globlib.iglob(glob_pattern, root_dir=str(root), recursive=True)
             matches = []
             file_count = 0
 
@@ -362,17 +365,16 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
                         "Please use a more specific pattern."
                     )
 
-                if not os.path.isfile(filepath):
-                    continue
                 # Validate path is within project and get validated path
                 try:
                     validated_path = _validate_path(filepath)
                 except ValueError:
                     continue
+                if not validated_path.is_file():
+                    continue
 
                 try:
                     # Line-by-line search for memory efficiency
-                    # Use validated_path to prevent TOCTOU attacks
                     with open(validated_path, encoding="utf-8", errors="ignore") as f:
                         for line_num, line in enumerate(f, 1):
                             if search_term in line:
@@ -397,13 +399,24 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
 
 
 def get_client() -> anthropic.Anthropic:
-    """Create an Anthropic API client from key file or environment."""
-    api_key = _api_key or os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "No API key found. Use --key-file or set ANTHROPIC_API_KEY."
-        )
-    return anthropic.Anthropic(api_key=api_key)
+    """Get or create a cached Anthropic API client.
+
+    Double-checked locking ensures thread safety without contention
+    on the hot path.
+    """
+    global _client
+    if _client is not None:
+        return _client
+    with _client_lock:
+        if _client is not None:
+            return _client
+        api_key = _api_key or os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "No API key found. Use --key-file or set ANTHROPIC_API_KEY."
+            )
+        _client = anthropic.Anthropic(api_key=api_key)
+        return _client
 
 
 def get_session(session_id: str, model_alias: str) -> dict[str, Any]:
@@ -450,7 +463,8 @@ def build_content_blocks(
     # Add text files as text blocks
     for path in file_paths or []:
         try:
-            content = Path(path).read_text(encoding="utf-8")
+            p = _validate_path(path)
+            content = p.read_text(encoding="utf-8")
             blocks.append({
                 "type": "text",
                 "text": f"--- START FILE: {path} ---\n{content}\n--- END FILE: {path} ---",
@@ -461,7 +475,7 @@ def build_content_blocks(
     # Add media files (images, PDFs)
     for path in media_paths or []:
         try:
-            p = Path(path)
+            p = _validate_path(path)
             if p.stat().st_size > MAX_INLINE_MEDIA:
                 blocks.append({
                     "type": "text",
@@ -516,13 +530,16 @@ def build_content_blocks(
     return blocks
 
 
-def _filter_thinking_blocks(content: list) -> list:
+def _filter_thinking_blocks(content: list, thinking_enabled: bool) -> list:
     """
-    Filter out thinking blocks from response content.
+    Filter thinking blocks from response content when thinking is disabled.
 
-    Anthropic API rejects thinking blocks in subsequent request history,
-    so we must remove them before adding to message history.
+    When extended thinking is enabled, the API *requires* thinking blocks
+    in history for multi-turn conversations. When disabled, they must be
+    stripped or the API rejects them.
     """
+    if thinking_enabled:
+        return list(content)
     return [block for block in content if getattr(block, "type", None) != "thinking"]
 
 
@@ -549,13 +566,16 @@ def run_agentic_loop(
     }
 
     # Add extended thinking if requested (only for supported models)
-    if extended_thinking and model in (get_model_aliases().get("sonnet"), get_model_aliases().get("opus")):
+    thinking_capable = any(f"claude-{tier}" in model for tier in ("sonnet", "opus"))
+    if extended_thinking and thinking_capable:
         kwargs["thinking"] = {
             "type": "enabled",
             "budget_tokens": thinking_budget,
         }
         # Extended thinking requires higher max_tokens
         kwargs["max_tokens"] = max(kwargs["max_tokens"], thinking_budget + 8000)
+
+    thinking_enabled = "thinking" in kwargs
 
     tool_call_count = 0
 
@@ -574,7 +594,7 @@ def run_agentic_loop(
                     thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
 
             # Add final assistant response to history (filter thinking blocks)
-            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content)})
+            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
 
             # Include thinking if present
             if thinking_parts:
@@ -586,7 +606,7 @@ def run_agentic_loop(
         # Handle tool use
         if response.stop_reason == "tool_use":
             # Add assistant's response to messages (filter thinking blocks)
-            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content)})
+            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
 
             # Process each tool call
             tool_results = []
@@ -617,7 +637,7 @@ def run_agentic_loop(
                 elif block.type == "thinking":
                     thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
 
-            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content)})
+            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
 
             if thinking_parts:
                 result = "\n\n".join(thinking_parts + text_parts)
@@ -634,7 +654,7 @@ def run_agentic_loop(
             elif block.type == "thinking":
                 thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
 
-        messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content)})
+        messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
 
         if thinking_parts:
             result = "\n\n".join(thinking_parts + text_parts)
@@ -665,6 +685,28 @@ def _consult(
 
     if thinking_budget < 1000 or thinking_budget > 100000:
         return "Error: thinking_budget must be between 1000 and 100000."
+
+    # Validate file paths before touching the API
+    if file_paths:
+        for path in file_paths:
+            try:
+                validated = _validate_path(path)
+                if validated.stat().st_size > MAX_FILE_SIZE:
+                    return f"Error: File '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
+            except ValueError as e:
+                return f"Error: {e}"
+            except OSError as e:
+                return f"Error accessing '{path}': {e}"
+    if media_paths:
+        for path in media_paths:
+            try:
+                validated = _validate_path(path)
+                if validated.stat().st_size > MAX_INLINE_MEDIA:
+                    return f"Error: Media '{path}' exceeds {MAX_INLINE_MEDIA // (1024*1024)}MB limit."
+            except ValueError as e:
+                return f"Error: {e}"
+            except OSError as e:
+                return f"Error accessing '{path}': {e}"
 
     client = get_client()
 
@@ -916,7 +958,7 @@ def internal_tools() -> dict[str, Any]:
 
 
 def main() -> None:
-    global _api_key
+    global _api_key, _project_root
 
     # Configure logging
     logging.basicConfig(
@@ -947,6 +989,9 @@ def main() -> None:
             print(f"Error: Key file not found: {args.key_file}", file=sys.stderr)
             sys.exit(1)
         _api_key = args.key_file.read_text().strip()
+
+    # Capture project root at startup before CWD can change
+    _project_root = Path.cwd().resolve()
 
     logger.info("Starting cpal MCP server")
     mcp.run()
