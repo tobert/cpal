@@ -213,9 +213,12 @@ usually in git repositories.
 You have tools: list_directory, read_file, and search_project.
 Use them proactively to explore the codebase—don't guess when you can verify.
 
-You have a large context window (200K tokens). Read files and gather
-complete context before providing your analysis.
+You have a large context window. Read files and gather complete context
+before providing your analysis.
 """
+
+# Beta header for 1M context window (tier 4+ orgs, premium pricing above 200K)
+CONTEXT_1M_BETA = "context-1m-2025-08-07"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Server & State
@@ -569,6 +572,7 @@ def run_agentic_loop(
     thinking_budget: int = 10000,
     max_tool_calls: int = 25,
     effort: str | None = None,
+    context_1m: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     """
     Run Claude with tool use, executing tools until we get a final response.
@@ -583,6 +587,10 @@ def run_agentic_loop(
         "messages": messages,
         "tools": CLAUDE_TOOLS,
     }
+
+    # 1M context window beta
+    if context_1m:
+        kwargs["betas"] = [CONTEXT_1M_BETA]
 
     # Thinking configuration — all models think by default
     if extended_thinking:
@@ -604,10 +612,13 @@ def run_agentic_loop(
 
     thinking_enabled = "thinking" in kwargs
 
+    # Select API endpoint — beta for 1M context, standard otherwise
+    create_fn = client.beta.messages.create if context_1m else client.messages.create
+
     tool_call_count = 0
 
     while tool_call_count < max_tool_calls:
-        response = client.messages.create(**kwargs)
+        response = create_fn(**kwargs)
 
         # Check if we're done (no tool use)
         if response.stop_reason == "end_turn":
@@ -705,6 +716,7 @@ def _consult(
     thinking_budget: int = 10000,
     max_tool_calls: int | None = None,
     effort: str | None = None,
+    context_1m: bool = False,
 ) -> str:
     """Send a query to Claude with optional file/media context."""
     # Input validation
@@ -765,6 +777,7 @@ def _consult(
                 thinking_budget=thinking_budget,
                 max_tool_calls=max_tool_calls,
                 effort=effort,
+                context_1m=context_1m,
             )
             # Only update session on success; prune to prevent unbounded growth
             if len(updated_messages) > MAX_SESSION_MESSAGES:
@@ -797,6 +810,7 @@ def consult_claude(
     thinking_budget: int = 10000,
     max_tool_calls: int | None = None,
     effort: str | None = None,
+    context_1m: bool = False,
 ) -> str:
     """
     Consult Claude for logical precision, planning, and focused analysis.
@@ -828,11 +842,12 @@ def consult_claude(
         thinking_budget: Max tokens for thinking (default 10000, max ~100000).
         max_tool_calls: Max autonomous tool calls (default varies by model).
         effort: Output effort level: "low", "medium", "high", or "max".
+        context_1m: Enable 1M token context window (beta, tier 4+, premium pricing above 200K).
     """
     logger.debug(f"consult_claude: session={session_id}, model={model}")
     return _consult(
         query, session_id, model, file_paths, media_paths,
-        extended_thinking, thinking_budget, max_tool_calls, effort
+        extended_thinking, thinking_budget, max_tool_calls, effort, context_1m
     )
 
 
@@ -918,7 +933,8 @@ def count_tokens(
                 "budget_tokens": thinking_budget,
             }
 
-        result = client.messages.count_tokens(**kwargs)
+        count_fn = client.messages.count_tokens
+        result = count_fn(**kwargs)
         return {"input_tokens": result.input_tokens, "model": model_id}
     except Exception as e:
         return {"error": str(e)}
@@ -938,11 +954,15 @@ def create_batch(
     extended_thinking: bool = True,
     thinking_budget: int = 10000,
     effort: str | None = "max",
+    context_1m: bool = False,
 ) -> dict[str, Any]:
     """Create a message batch for fire-and-forget processing (50% cost discount).
 
     Batches run asynchronously and complete within 24 hours. No agentic tool loops —
     each query is a single-shot request. Use list_batches/get_batch to check status.
+
+    **Important:** Batch queries have no tool use — Claude cannot explore the codebase.
+    Inline all relevant code/context directly in the query string.
 
     Args:
         queries: List of {custom_id: str, query: str} dicts.
@@ -952,6 +972,7 @@ def create_batch(
         extended_thinking: Enable thinking (default: True).
         thinking_budget: Thinking budget tokens (default: 10000, ignored for adaptive).
         effort: Output effort level (default: "max"). Set None to omit.
+        context_1m: Enable 1M token context window (beta, tier 4+, premium pricing above 200K).
     """
     try:
         client = get_client()
@@ -990,7 +1011,12 @@ def create_batch(
                 "params": params,
             })
 
-        result = client.messages.batches.create(requests=requests)
+        if context_1m:
+            result = client.beta.messages.batches.create(
+                requests=requests, betas=[CONTEXT_1M_BETA],
+            )
+        else:
+            result = client.messages.batches.create(requests=requests)
         return {
             "batch_id": result.id,
             "status": result.processing_status,
@@ -1149,6 +1175,7 @@ def server_info() -> dict[str, Any]:
         "features": [
             "extended_thinking", "adaptive_thinking", "vision",
             "stateful_sessions", "batch", "token_counting", "effort",
+            "context_1m",
         ],
     }
 
