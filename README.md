@@ -22,7 +22,7 @@ Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
 git clone https://github.com/tobert/cpal && cd cpal
-uv tool install -e .
+uv tool install .
 ```
 
 ### API Key (choose one)
@@ -38,7 +38,11 @@ echo "sk-ant-..." > ~/.config/cpal/api_key && chmod 600 ~/.config/cpal/api_key
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
+If both are set, `--key-file` takes priority over the environment variable.
+
 ## Configure
+
+Pick the method that matches your MCP client:
 
 ### [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 
@@ -98,15 +102,12 @@ Your AI host calls these MCP tools automatically based on your prompts. The exam
 # Basic (uses Opus)
 consult_claude(query="Design a caching strategy for this API")
 
-# With extended thinking
-consult_claude(
-    query="Review for subtle bugs",
-    file_paths=["src/server.py"],
-    extended_thinking=True
-)
-
-# Control thinking budget (default 10000, max ~100000)
+# Extended thinking is enabled by default (extended_thinking=True)
+# Control the thinking budget (default 10000, max ~100000)
 consult_claude(query="Analyze this algorithm", thinking_budget=50000)
+
+# Disable thinking for simple queries
+consult_claude(query="What does this function do?", extended_thinking=False)
 
 # Vision
 consult_claude(query="What's wrong with this UI?", media_paths=["screenshot.png"])
@@ -119,7 +120,7 @@ consult_claude(query="Quick check", model="haiku")   # fast & cheap
 consult_claude(query="Explain the auth flow", session_id="review-123")
 consult_claude(query="What about edge cases?", session_id="review-123")  # continues
 
-# Effort control — tune output depth
+# Effort control — tune output depth (low, medium, high, max)
 consult_claude(query="Quick summary", effort="low")
 consult_claude(query="Exhaustive analysis", effort="max")
 
@@ -151,7 +152,8 @@ MCP Client (Gemini, Cursor, etc.)
     │  cpal   │ ──▶ Anthropic API ──▶ Claude
     └─────────┘
          │
-    Claude autonomously uses tools:
+    cpal gives Claude these tools to
+    autonomously explore your codebase:
     • list_directory
     • read_file
     • search_project
@@ -159,9 +161,9 @@ MCP Client (Gemini, Cursor, etc.)
 
 ## Security
 
-- Restricted to project directory
-- Validates file reads
-- Session isolation
+- All file access is sandboxed to the directory where cpal was started
+- Path traversal and symlink attacks are blocked
+- Sessions are isolated per `session_id`
 - File size limits: 10MB text, 20MB media
 
 ## Batch API
@@ -188,7 +190,7 @@ cancel_batch(batch_id="msgbatch_...")
 
 **No delete API** — Anthropic does not provide an endpoint to delete batch results. Batches are automatically purged after 29 days.
 
-**No tool use** — batch queries are single-shot (no agentic file exploration). Inline all relevant context in the query string.
+**No tool use** — batch queries are single-shot (no agentic file exploration). Parameters like `file_paths` and `media_paths` are not available in batch mode — paste content directly into the `query` string.
 
 ## MCP Resources
 
@@ -203,12 +205,22 @@ Read-only introspection endpoints for MCP clients that support resources:
 | `resource://session/{session_id}` | Details for a specific session (message count, preview) |
 | `resource://tools/internal` | Tools Claude uses for autonomous exploration |
 
+## Models
+
+Model aliases are resolved automatically to the latest version per tier via the Anthropic API. Use `list_models()` to see current mappings. Fallback IDs if the API is unreachable:
+
+| Alias | Fallback ID | Default Tool Calls | Best For |
+|-------|-------------|-------------------|----------|
+| `opus` | `claude-opus-4-5-20251101` | 10 | Deep reasoning, hard problems (default) |
+| `sonnet` | `claude-sonnet-4-5-20250929` | 25 | Balanced reasoning, code review |
+| `haiku` | `claude-haiku-4-5-20251001` | 50 | Fast exploration, quick questions |
+
 ## Notes
 
-- **Sessions are in-memory** — history is lost when the server restarts.
-- **Models cost money** — Opus is the default and the most expensive. Use `haiku` or `sonnet` for lower costs.
+- **Sessions are in-memory** — history is lost when the server restarts. Sessions expire after 1 hour of inactivity.
+- **Models cost money** — Opus is the default and the most expensive. See [Anthropic pricing](https://www.anthropic.com/pricing#702702). Use `haiku` or `sonnet` for lower costs.
 - **Vision** — Supports PNG, JPEG, GIF, WebP, and PDF (max 20MB).
-- **1M context** — Requires [Anthropic API tier 4+](https://docs.anthropic.com/en/api/rate-limits#requirements-to-advance-tier). Premium pricing applies above 200K tokens.
+- **1M context** — Requires [Anthropic API tier 4+](https://docs.anthropic.com/en/api/rate-limits#requirements-to-advance-tier). Premium pricing applies above 200K tokens. The default context window is 200K tokens.
 
 ## Development
 
