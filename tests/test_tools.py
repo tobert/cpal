@@ -3,7 +3,9 @@
 import os
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -391,7 +393,8 @@ class TestFilterThinkingBlocks:
     def _make_block(self, block_type: str, text: str = "hello"):
         """Create a mock block with a type attribute."""
         class MockBlock:
-            pass
+            type: str
+            text: str
         b = MockBlock()
         b.type = block_type
         b.text = text
@@ -467,7 +470,7 @@ class TestThinkingDefaults:
         import inspect
         from cpal.server import consult_claude
         # FastMCP wraps the function; access the underlying callable
-        fn = consult_claude.fn if hasattr(consult_claude, "fn") else consult_claude
+        fn = cast(Callable[..., Any], getattr(consult_claude, "fn", consult_claude))
         sig = inspect.signature(fn)
         assert sig.parameters["extended_thinking"].default is True
 
@@ -488,7 +491,7 @@ class TestThinkingDefaults:
         """consult_claude should accept effort parameter."""
         import inspect
         from cpal.server import consult_claude
-        fn = consult_claude.fn if hasattr(consult_claude, "fn") else consult_claude
+        fn = cast(Callable[..., Any], getattr(consult_claude, "fn", consult_claude))
         sig = inspect.signature(fn)
         assert "effort" in sig.parameters
         assert sig.parameters["effort"].default is None
