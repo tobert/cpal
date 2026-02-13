@@ -50,6 +50,16 @@ DEFAULT_TOOL_CALLS = {
     "opus": 1000,
 }
 
+# Override per-tier defaults with CPAL_MAX_TOOL_CALLS env var
+_max_tool_calls_override = os.getenv("CPAL_MAX_TOOL_CALLS")
+if _max_tool_calls_override is not None:
+    try:
+        _override = int(_max_tool_calls_override)
+        if _override >= 1:
+            DEFAULT_TOOL_CALLS = {k: _override for k in DEFAULT_TOOL_CALLS}
+    except ValueError:
+        pass  # Ignore invalid values, use defaults
+
 FALLBACK_ALIASES: dict[str, str] = {
     "haiku": "claude-haiku-4-5-20251001",    # Haiku 4.5
     "sonnet": "claude-sonnet-4-5-20250929",  # Sonnet 4.5
@@ -714,7 +724,6 @@ def _consult(
     media_paths: list[str] | None = None,
     extended_thinking: bool = True,
     thinking_budget: int = 10000,
-    max_tool_calls: int | None = None,
     effort: str | None = None,
     context_1m: bool = False,
 ) -> str:
@@ -756,9 +765,7 @@ def _consult(
         session = get_session(session_id, model_alias)
         model = session["model"]
 
-        # Use tier-specific default if not specified
-        if max_tool_calls is None:
-            max_tool_calls = DEFAULT_TOOL_CALLS.get(model_alias.lower(), 1000)
+        max_tool_calls = DEFAULT_TOOL_CALLS.get(model_alias.lower(), 1000)
 
         # Build the user message content
         content = build_content_blocks(query, file_paths, media_paths)
@@ -808,7 +815,6 @@ def consult_claude(
     media_paths: list[str] | None = None,
     extended_thinking: bool = True,
     thinking_budget: int = 10000,
-    max_tool_calls: int | None = None,
     effort: str | None = None,
     context_1m: bool = False,
 ) -> str:
@@ -840,14 +846,13 @@ def consult_claude(
         media_paths: Images (.png, .jpg, .webp, .gif) or PDFs for vision analysis.
         extended_thinking: Enable chain-of-thought reasoning (recommended for analysis).
         thinking_budget: Max tokens for thinking (default 10000, max ~100000).
-        max_tool_calls: Max autonomous tool calls (default varies by model).
         effort: Output effort level: "low", "medium", "high", or "max".
         context_1m: Enable 1M token context window (beta, tier 4+, premium pricing above 200K).
     """
     logger.debug(f"consult_claude: session={session_id}, model={model}")
     return _consult(
         query, session_id, model, file_paths, media_paths,
-        extended_thinking, thinking_budget, max_tool_calls, effort, context_1m
+        extended_thinking, thinking_budget, effort, context_1m
     )
 
 

@@ -142,21 +142,8 @@ consult_claude(
 
 ### Tool Call Limits
 
-Default limits are tier-specific but can be overridden per-call:
-
-| Model | Default | Rationale |
-|-------|---------|-----------|
-| Haiku | 50 | Cheap and fast — let it rip |
-| Sonnet | 25 | Balanced |
-| Opus | 10 | Expensive — chill out |
-
-```python
-# Let Haiku explore extensively
-consult_claude(query="...", model="haiku", max_tool_calls=100)
-
-# Constrain Opus to save costs
-consult_claude(query="...", model="opus", max_tool_calls=5)
-```
+All tiers default to 1000 tool calls. Override globally with the `CPAL_MAX_TOOL_CALLS`
+environment variable (e.g. `CPAL_MAX_TOOL_CALLS=50`).
 
 ## Installing
 

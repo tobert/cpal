@@ -124,9 +124,6 @@ consult_claude(query="What about edge cases?", session_id="review-123")  # conti
 consult_claude(query="Quick summary", effort="low")
 consult_claude(query="Exhaustive analysis", effort="max")
 
-# Limit tool calls (defaults: opus=10, sonnet=25, haiku=50)
-consult_claude(query="Explore this codebase", max_tool_calls=5)
-
 # 1M context window (beta, tier 4+, premium pricing above 200K tokens)
 consult_claude(query="Analyze this large codebase", context_1m=True)
 ```
@@ -209,11 +206,13 @@ Read-only introspection endpoints for MCP clients that support resources:
 
 Model aliases are resolved automatically to the latest version per tier via the Anthropic API. Use `list_models()` to see current mappings. Fallback IDs if the API is unreachable:
 
-| Alias | Fallback ID | Default Tool Calls | Best For |
-|-------|-------------|-------------------|----------|
-| `opus` | `claude-opus-4-5-20251101` | 10 | Deep reasoning, hard problems (default) |
-| `sonnet` | `claude-sonnet-4-5-20250929` | 25 | Balanced reasoning, code review |
-| `haiku` | `claude-haiku-4-5-20251001` | 50 | Fast exploration, quick questions |
+| Alias | Fallback ID | Best For |
+|-------|-------------|----------|
+| `opus` | `claude-opus-4-5-20251101` | Deep reasoning, hard problems (default) |
+| `sonnet` | `claude-sonnet-4-5-20250929` | Balanced reasoning, code review |
+| `haiku` | `claude-haiku-4-5-20251001` | Fast exploration, quick questions |
+
+Claude can make up to 1000 autonomous tool calls per query by default. Override with the `CPAL_MAX_TOOL_CALLS` environment variable.
 
 ## Notes
 
