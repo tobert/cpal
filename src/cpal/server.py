@@ -42,6 +42,7 @@ MAX_INLINE_MEDIA = 20 * 1024 * 1024  # 20 MB - inline media limit
 MAX_SEARCH_FILES = 1000
 MAX_SEARCH_MATCHES = 20
 SESSION_TTL = 3600  # 1 hour - sessions expire after this
+MAX_SESSION_MESSAGES = 200  # Prune oldest messages beyond this
 # Default tool call limits (can be overridden per-call)
 DEFAULT_TOOL_CALLS = {
     "haiku": 1000,
@@ -84,7 +85,9 @@ def _fetch_latest_models() -> dict[str, str] | None:
                     break
 
         if latest:
-            result = {tier: model_id for tier, (_, model_id) in latest.items()}
+            # Merge into fallbacks so partial discovery doesn't lose tiers
+            result = FALLBACK_ALIASES.copy()
+            result.update({tier: model_id for tier, (_, model_id) in latest.items()})
             logger.info(f"Discovered models: {result}")
             return result
 
@@ -254,7 +257,12 @@ def cleanup_old_sessions() -> int:
     ]
     for sid in to_remove:
         del sessions[sid]
-        # Don't delete from _session_locks — another thread may hold the lock
+    # Clean up locks for removed sessions (only if not currently held)
+    with _locks_lock:
+        for sid in to_remove:
+            lock = _session_locks.get(sid)
+            if lock is not None and not lock.locked():
+                del _session_locks[sid]
     return len(to_remove)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -354,6 +362,8 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
 
     elif name == "search_project":
         search_term = input_data.get("search_term", "")
+        if not search_term:
+            return "Error: search_term cannot be empty."
         glob_pattern = input_data.get("glob_pattern", "**/*")
         try:
             # Anchor glob to project root (not CWD)
@@ -756,7 +766,9 @@ def _consult(
                 max_tool_calls=max_tool_calls,
                 effort=effort,
             )
-            # Only update session on success
+            # Only update session on success; prune to prevent unbounded growth
+            if len(updated_messages) > MAX_SESSION_MESSAGES:
+                updated_messages = updated_messages[-MAX_SESSION_MESSAGES:]
             session["messages"] = updated_messages
 
             return response_text
@@ -857,6 +869,7 @@ def count_tokens(
     model: str = "opus",
     system: str | None = None,
     file_paths: list[str] | None = None,
+    thinking_budget: int = 10000,
 ) -> dict[str, Any]:
     """Count tokens for a message without sending it (free endpoint).
 
@@ -868,8 +881,21 @@ def count_tokens(
         model: Model to count against ("opus", "sonnet", "haiku").
         system: Custom system prompt (defaults to cpal's built-in prompt).
         file_paths: Text files to include in the count.
+        thinking_budget: Thinking budget to use for count (default 10000, ignored for adaptive).
     """
     try:
+        # Validate file sizes before building content
+        if file_paths:
+            for path in file_paths:
+                try:
+                    validated = _validate_path(path)
+                    if validated.stat().st_size > MAX_FILE_SIZE:
+                        return {"error": f"File '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."}
+                except ValueError as e:
+                    return {"error": str(e)}
+                except OSError as e:
+                    return {"error": f"Error accessing '{path}': {e}"}
+
         client = get_client()
         aliases = get_model_aliases()
         model_id = aliases.get(model.lower(), model)
@@ -883,13 +909,13 @@ def count_tokens(
             "tools": CLAUDE_TOOLS,
         }
 
-        # Thinking affects token count
+        # Thinking affects token count — match actual request params
         if _is_opus_46(model_id):
             kwargs["thinking"] = {"type": "adaptive"}
         else:
             kwargs["thinking"] = {
                 "type": "enabled",
-                "budget_tokens": 10000,
+                "budget_tokens": thinking_budget,
             }
 
         result = client.messages.count_tokens(**kwargs)
@@ -1015,6 +1041,7 @@ def list_batches(limit: int = 20) -> dict[str, Any]:
         limit: Maximum number of batches to return (default: 20).
     """
     try:
+        limit = max(1, min(limit, 100))  # Clamp to valid range
         client = get_client()
         result = client.messages.batches.list(limit=limit)
         batches = []

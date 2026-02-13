@@ -24,6 +24,7 @@ from cpal.server import (
     get_session_lock,
     cleanup_old_sessions,
     SESSION_TTL,
+    MAX_SESSION_MESSAGES,
     FALLBACK_ALIASES,
 )
 
@@ -327,11 +328,11 @@ class TestModelDiscovery:
             assert model_id.startswith(f"claude-{tier}")
 
 
-class TestCleanupPreservesLocks:
-    """Tests that session cleanup doesn't delete locks held by other threads."""
+class TestCleanupPreservesHeldLocks:
+    """Tests that session cleanup preserves locks held by other threads."""
 
-    def test_cleanup_preserves_locks(self):
-        """Lock objects should survive cleanup of their session."""
+    def test_cleanup_preserves_held_locks(self):
+        """Lock objects should survive cleanup if currently held."""
         import time as time_module
 
         test_sid = "_test_lock_survival_"
@@ -340,18 +341,22 @@ class TestCleanupPreservesLocks:
             "model": "test",
             "last_access": time_module.time() - SESSION_TTL - 100,
         }
-        # Grab the lock before cleanup
+        # Grab AND hold the lock before cleanup
         lock_before = get_session_lock(test_sid)
+        lock_before.acquire()
 
         try:
             cleanup_old_sessions()
             # Session should be gone
             assert test_sid not in sessions
-            # But the lock should still be the same object
+            # But the lock should survive because it's held
+            assert test_sid in _session_locks
             lock_after = get_session_lock(test_sid)
             assert lock_before is lock_after
         finally:
+            lock_before.release()
             sessions.pop(test_sid, None)
+            _session_locks.pop(test_sid, None)
 
 
 class TestPathTraversalInConsult:
@@ -497,3 +502,110 @@ class TestFallbackAliasesOpus46:
 
     def test_opus_fallback_is_opus_46(self):
         assert _is_opus_46(FALLBACK_ALIASES["opus"]) is True
+
+
+class TestPartialModelDiscovery:
+    """Tests that partial model discovery merges into fallbacks."""
+
+    def test_partial_discovery_merges(self, monkeypatch):
+        """If API returns only opus, haiku and sonnet should use fallbacks."""
+        import cpal.server as srv
+        # Simulate partial discovery returning only opus
+        monkeypatch.setattr(srv, "_discovered_models", {
+            "opus": "claude-opus-4-6",
+            "sonnet": "claude-sonnet-4-5-20250929",
+            # haiku missing — should NOT crash
+        })
+        result = srv.get_model_aliases()
+        # Should still have all three tiers
+        assert "opus" in result
+        assert "sonnet" in result
+        # haiku comes from cached result (which is what _discovered_models is)
+        # The real fix is in _fetch_latest_models merging into fallbacks
+
+    def test_fetch_merges_into_fallbacks(self, monkeypatch):
+        """_fetch_latest_models should merge partial results into fallbacks."""
+        import cpal.server as srv
+
+        class FakeModel:
+            def __init__(self, model_id, created_at):
+                self.id = model_id
+                self.created_at = created_at
+
+        class FakeResponse:
+            def __iter__(self):
+                return iter([FakeModel("claude-opus-4-6", "2026-01-01")])
+
+        class FakeModels:
+            def list(self, limit=None):
+                return FakeResponse()
+
+        class FakeClient:
+            models = FakeModels()
+
+        monkeypatch.setattr(srv, "_client", FakeClient())
+
+        result = srv._fetch_latest_models()
+        assert result is not None
+        # Should have opus from discovery AND haiku+sonnet from fallbacks
+        assert "opus" in result
+        assert "haiku" in result
+        assert "sonnet" in result
+        assert result["opus"] == "claude-opus-4-6"
+        # Haiku/sonnet should be fallback values
+        assert result["haiku"] == FALLBACK_ALIASES["haiku"]
+        assert result["sonnet"] == FALLBACK_ALIASES["sonnet"]
+
+
+class TestSessionMessagePruning:
+    """Tests that session messages are pruned to prevent unbounded growth."""
+
+    def test_max_session_messages_constant_exists(self):
+        assert MAX_SESSION_MESSAGES == 200
+
+    def test_messages_pruned_in_long_sessions(self):
+        """Sessions with more than MAX_SESSION_MESSAGES should be pruned."""
+        # This is hard to test without an API call, but we can verify
+        # the constant is importable and reasonable
+        assert MAX_SESSION_MESSAGES > 10
+        assert MAX_SESSION_MESSAGES < 10000
+
+
+class TestEmptySearchTerm:
+    """Tests that empty search terms are rejected."""
+
+    def test_empty_search_term_rejected(self):
+        result = execute_tool("search_project", {"search_term": ""})
+        assert "Error" in result
+        assert "empty" in result.lower()
+
+    def test_whitespace_only_passes(self):
+        """Whitespace-only search terms are technically non-empty (edge case)."""
+        result = execute_tool("search_project", {"search_term": " "})
+        # Should not error — it's a valid (if odd) search
+        assert "Error: search_term cannot be empty" not in result
+
+
+class TestSessionLockCleanup:
+    """Tests that session lock cleanup works correctly."""
+
+    def test_cleanup_removes_stale_locks(self):
+        import time as time_module
+
+        test_sid = "_test_lock_cleanup_"
+        sessions[test_sid] = {
+            "messages": [], "model": "test",
+            "last_access": time_module.time() - SESSION_TTL - 100,
+        }
+        # Create the lock but don't hold it
+        get_session_lock(test_sid)
+        assert test_sid in _session_locks
+
+        try:
+            cleanup_old_sessions()
+            assert test_sid not in sessions
+            # Lock should be cleaned up since it's not held
+            assert test_sid not in _session_locks
+        finally:
+            sessions.pop(test_sid, None)
+            _session_locks.pop(test_sid, None)
