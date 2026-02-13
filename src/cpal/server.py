@@ -1061,7 +1061,8 @@ def get_batch(batch_id: str) -> dict[str, Any]:
 def list_batches(limit: int = 20) -> dict[str, Any]:
     """List recent message batches (restart-safe, queries API directly).
 
-    Anthropic retains batch metadata for 29 days.
+    Anthropic retains batch metadata for 29 days. There is no API to delete
+    batches — they are automatically purged after 29 days.
 
     Args:
         limit: Maximum number of batches to return (default: 20).

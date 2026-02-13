@@ -122,6 +122,32 @@ MCP Client (Gemini, Cursor, etc.)
 - Session isolation
 - File size limits: 10MB text, 20MB media
 
+## Batch API
+
+Fire-and-forget processing at 50% cost discount. Batches complete within 24 hours.
+
+```python
+# Submit a batch
+create_batch(queries=[
+    {"custom_id": "review-1", "query": "Review this code: ..."},
+    {"custom_id": "review-2", "query": "Review this other code: ..."},
+])
+
+# Check status
+list_batches()
+get_batch(batch_id="msgbatch_...")
+
+# Get results when done
+get_batch_results(batch_id="msgbatch_...")
+
+# Cancel a processing batch
+cancel_batch(batch_id="msgbatch_...")
+```
+
+**No delete API** — Anthropic does not provide an endpoint to delete batch results. Batches are automatically purged after 29 days.
+
+**No tool use** — batch queries are single-shot (no agentic file exploration). Inline all relevant context in the query string.
+
 ## Notes
 
 - **Sessions are in-memory** — history is lost when the server restarts.
