@@ -17,6 +17,7 @@ from cpal.server import (
     is_text_file,
     _validate_path,
     _filter_thinking_blocks,
+    _is_opus_46,
     _consult,
     sessions,
     _session_locks,
@@ -412,3 +413,87 @@ class TestFilterThinkingBlocks:
         types = [b.type for b in result]
         assert "thinking" in types
         assert "text" in types
+
+    def test_strips_redacted_thinking_when_disabled(self):
+        """Redacted thinking blocks should also be stripped when disabled."""
+        blocks = [
+            self._make_block("redacted_thinking"),
+            self._make_block("thinking"),
+            self._make_block("text"),
+        ]
+        result = _filter_thinking_blocks(blocks, thinking_enabled=False)
+        assert len(result) == 1
+        assert result[0].type == "text"
+
+    def test_preserves_redacted_thinking_when_enabled(self):
+        """Redacted thinking blocks should be preserved when enabled."""
+        blocks = [
+            self._make_block("redacted_thinking"),
+            self._make_block("text"),
+        ]
+        result = _filter_thinking_blocks(blocks, thinking_enabled=True)
+        assert len(result) == 2
+
+
+class TestIsOpus46:
+    """Tests for _is_opus_46 helper."""
+
+    def test_opus_46_bare(self):
+        assert _is_opus_46("claude-opus-4-6") is True
+
+    def test_opus_46_with_date(self):
+        assert _is_opus_46("claude-opus-4-6-20260101") is True
+
+    def test_opus_45(self):
+        assert _is_opus_46("claude-opus-4-5-20251101") is False
+
+    def test_sonnet(self):
+        assert _is_opus_46("claude-sonnet-4-5-20250929") is False
+
+    def test_haiku(self):
+        assert _is_opus_46("claude-haiku-4-5-20251001") is False
+
+
+class TestThinkingDefaults:
+    """Tests that thinking is on by default."""
+
+    def test_consult_claude_default_thinking_true(self):
+        """consult_claude defaults to extended_thinking=True."""
+        import inspect
+        from cpal.server import consult_claude
+        # FastMCP wraps the function; access the underlying callable
+        fn = consult_claude.fn if hasattr(consult_claude, "fn") else consult_claude
+        sig = inspect.signature(fn)
+        assert sig.parameters["extended_thinking"].default is True
+
+    def test_consult_default_thinking_true(self):
+        """_consult defaults to extended_thinking=True."""
+        import inspect
+        sig = inspect.signature(_consult)
+        assert sig.parameters["extended_thinking"].default is True
+
+    def test_consult_has_effort_param(self):
+        """_consult should accept effort parameter."""
+        import inspect
+        sig = inspect.signature(_consult)
+        assert "effort" in sig.parameters
+        assert sig.parameters["effort"].default is None
+
+    def test_consult_claude_has_effort_param(self):
+        """consult_claude should accept effort parameter."""
+        import inspect
+        from cpal.server import consult_claude
+        fn = consult_claude.fn if hasattr(consult_claude, "fn") else consult_claude
+        sig = inspect.signature(fn)
+        assert "effort" in sig.parameters
+        assert sig.parameters["effort"].default is None
+
+
+class TestFallbackAliasesOpus46:
+    """Test that opus fallback is now Opus 4.6."""
+
+    def test_opus_fallback_is_46(self):
+        assert FALLBACK_ALIASES["opus"] == "claude-opus-4-6"
+
+    def test_opus_fallback_is_opus_46(self):
+        assert _is_opus_46(FALLBACK_ALIASES["opus"]) is True

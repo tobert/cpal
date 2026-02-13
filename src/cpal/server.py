@@ -52,7 +52,7 @@ DEFAULT_TOOL_CALLS = {
 FALLBACK_ALIASES: dict[str, str] = {
     "haiku": "claude-haiku-4-5-20251001",    # Haiku 4.5
     "sonnet": "claude-sonnet-4-5-20250929",  # Sonnet 4.5
-    "opus": "claude-opus-4-5-20251101",      # Opus 4.5
+    "opus": "claude-opus-4-6",               # Opus 4.6
 }
 
 # Known tiers we care about
@@ -113,6 +113,11 @@ def get_model_aliases() -> dict[str, str]:
             _discovered_models = result
             return _discovered_models
         return FALLBACK_ALIASES.copy()
+
+def _is_opus_46(model: str) -> bool:
+    """Check if model is Opus 4.6 (supports adaptive thinking)."""
+    return "claude-opus-4-6" in model
+
 
 # MIME type mappings for multimodal support
 MIME_TYPES: dict[str, str] = {
@@ -540,16 +545,20 @@ def _filter_thinking_blocks(content: list, thinking_enabled: bool) -> list:
     """
     if thinking_enabled:
         return list(content)
-    return [block for block in content if getattr(block, "type", None) != "thinking"]
+    return [
+        block for block in content
+        if getattr(block, "type", None) not in ("thinking", "redacted_thinking")
+    ]
 
 
 def run_agentic_loop(
     client: anthropic.Anthropic,
     model: str,
     messages: list[dict[str, Any]],
-    extended_thinking: bool = False,
+    extended_thinking: bool = True,
     thinking_budget: int = 10000,
     max_tool_calls: int = 25,
+    effort: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """
     Run Claude with tool use, executing tools until we get a final response.
@@ -565,15 +574,23 @@ def run_agentic_loop(
         "tools": CLAUDE_TOOLS,
     }
 
-    # Add extended thinking if requested (only for supported models)
-    thinking_capable = any(f"claude-{tier}" in model for tier in ("sonnet", "opus"))
-    if extended_thinking and thinking_capable:
-        kwargs["thinking"] = {
-            "type": "enabled",
-            "budget_tokens": thinking_budget,
-        }
-        # Extended thinking requires higher max_tokens
-        kwargs["max_tokens"] = max(kwargs["max_tokens"], thinking_budget + 8000)
+    # Thinking configuration — all models think by default
+    if extended_thinking:
+        if _is_opus_46(model):
+            # Opus 4.6: adaptive thinking (model decides when/how much)
+            kwargs["thinking"] = {"type": "adaptive"}
+        else:
+            # All other models: manual thinking with explicit budget
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": thinking_budget,
+            }
+            # Manual thinking requires higher max_tokens
+            kwargs["max_tokens"] = max(kwargs["max_tokens"], thinking_budget + 8000)
+
+    # Effort parameter (API validates model support)
+    if effort is not None:
+        kwargs.setdefault("output_config", {})["effort"] = effort
 
     thinking_enabled = "thinking" in kwargs
 
@@ -674,9 +691,10 @@ def _consult(
     model_alias: str,
     file_paths: list[str] | None = None,
     media_paths: list[str] | None = None,
-    extended_thinking: bool = False,
+    extended_thinking: bool = True,
     thinking_budget: int = 10000,
     max_tool_calls: int | None = None,
+    effort: str | None = None,
 ) -> str:
     """Send a query to Claude with optional file/media context."""
     # Input validation
@@ -736,6 +754,7 @@ def _consult(
                 extended_thinking=extended_thinking,
                 thinking_budget=thinking_budget,
                 max_tool_calls=max_tool_calls,
+                effort=effort,
             )
             # Only update session on success
             session["messages"] = updated_messages
@@ -762,9 +781,10 @@ def consult_claude(
     model: str = "opus",
     file_paths: list[str] | None = None,
     media_paths: list[str] | None = None,
-    extended_thinking: bool = False,
+    extended_thinking: bool = True,
     thinking_budget: int = 10000,
     max_tool_calls: int | None = None,
+    effort: str | None = None,
 ) -> str:
     """
     Consult Claude for logical precision, planning, and focused analysis.
@@ -795,11 +815,12 @@ def consult_claude(
         extended_thinking: Enable chain-of-thought reasoning (recommended for analysis).
         thinking_budget: Max tokens for thinking (default 10000, max ~100000).
         max_tool_calls: Max autonomous tool calls (default varies by model).
+        effort: Output effort level: "low", "medium", "high", or "max".
     """
     logger.debug(f"consult_claude: session={session_id}, model={model}")
     return _consult(
         query, session_id, model, file_paths, media_paths,
-        extended_thinking, thinking_budget, max_tool_calls
+        extended_thinking, thinking_budget, max_tool_calls, effort
     )
 
 
@@ -821,12 +842,267 @@ def list_models() -> dict[str, Any]:
                     "sonnet": "Balanced reasoning, code review",
                     "opus": "Deep reasoning, hard problems",
                 }.get(alias, ""),
-                "extended_thinking": alias in ("sonnet", "opus"),
+                "extended_thinking": True,
+                "adaptive_thinking": _is_opus_46(model_id),
                 "default_tool_calls": DEFAULT_TOOL_CALLS.get(alias, 1000),
             }
             for alias, model_id in aliases.items()
         },
     }
+
+
+@mcp.tool()
+def count_tokens(
+    query: str,
+    model: str = "opus",
+    system: str | None = None,
+    file_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Count tokens for a message without sending it (free endpoint).
+
+    Useful for estimating costs and checking if content fits within context limits.
+    Includes cpal's internal tools and system prompt in the count for accuracy.
+
+    Args:
+        query: The message text to count tokens for.
+        model: Model to count against ("opus", "sonnet", "haiku").
+        system: Custom system prompt (defaults to cpal's built-in prompt).
+        file_paths: Text files to include in the count.
+    """
+    try:
+        client = get_client()
+        aliases = get_model_aliases()
+        model_id = aliases.get(model.lower(), model)
+
+        content = build_content_blocks(query, file_paths)
+
+        kwargs: dict[str, Any] = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": content}],
+            "system": system or SYSTEM_PROMPT,
+            "tools": CLAUDE_TOOLS,
+        }
+
+        # Thinking affects token count
+        if _is_opus_46(model_id):
+            kwargs["thinking"] = {"type": "adaptive"}
+        else:
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": 10000,
+            }
+
+        result = client.messages.count_tokens(**kwargs)
+        return {"input_tokens": result.input_tokens, "model": model_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch API Tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def create_batch(
+    queries: list[dict[str, str]],
+    model: str = "opus",
+    system: str | None = None,
+    max_tokens: int = 16384,
+    extended_thinking: bool = True,
+    thinking_budget: int = 10000,
+    effort: str | None = "max",
+) -> dict[str, Any]:
+    """Create a message batch for fire-and-forget processing (50% cost discount).
+
+    Batches run asynchronously and complete within 24 hours. No agentic tool loops —
+    each query is a single-shot request. Use list_batches/get_batch to check status.
+
+    Args:
+        queries: List of {custom_id: str, query: str} dicts.
+        model: Model alias or ID (default: "opus").
+        system: Custom system prompt (defaults to cpal's built-in prompt).
+        max_tokens: Max output tokens per request (default: 16384).
+        extended_thinking: Enable thinking (default: True).
+        thinking_budget: Thinking budget tokens (default: 10000, ignored for adaptive).
+        effort: Output effort level (default: "max"). Set None to omit.
+    """
+    try:
+        client = get_client()
+        aliases = get_model_aliases()
+        model_id = aliases.get(model.lower(), model)
+
+        requests = []
+        for item in queries:
+            custom_id = item.get("custom_id", "")
+            query = item.get("query", "")
+            if not custom_id or not query:
+                return {"error": "Each query must have 'custom_id' and 'query' fields."}
+
+            params: dict[str, Any] = {
+                "model": model_id,
+                "max_tokens": max_tokens,
+                "system": system or SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": query}],
+            }
+
+            if extended_thinking:
+                if _is_opus_46(model_id):
+                    params["thinking"] = {"type": "adaptive"}
+                else:
+                    params["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": thinking_budget,
+                    }
+                    params["max_tokens"] = max(max_tokens, thinking_budget + 8000)
+
+            if effort is not None:
+                params.setdefault("output_config", {})["effort"] = effort
+
+            requests.append({
+                "custom_id": custom_id,
+                "params": params,
+            })
+
+        result = client.messages.batches.create(requests=requests)
+        return {
+            "batch_id": result.id,
+            "status": result.processing_status,
+            "request_count": len(requests),
+            "created_at": str(result.created_at),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_batch(batch_id: str) -> dict[str, Any]:
+    """Get the status of a message batch.
+
+    Args:
+        batch_id: The batch ID returned by create_batch.
+    """
+    try:
+        client = get_client()
+        result = client.messages.batches.retrieve(batch_id)
+        response: dict[str, Any] = {
+            "batch_id": result.id,
+            "status": result.processing_status,
+            "created_at": str(result.created_at),
+        }
+        if result.request_counts:
+            response["request_counts"] = {
+                "processing": result.request_counts.processing,
+                "succeeded": result.request_counts.succeeded,
+                "errored": result.request_counts.errored,
+                "canceled": result.request_counts.canceled,
+                "expired": result.request_counts.expired,
+            }
+        if result.ended_at:
+            response["ended_at"] = str(result.ended_at)
+        return response
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def list_batches(limit: int = 20) -> dict[str, Any]:
+    """List recent message batches (restart-safe, queries API directly).
+
+    Anthropic retains batch metadata for 29 days.
+
+    Args:
+        limit: Maximum number of batches to return (default: 20).
+    """
+    try:
+        client = get_client()
+        result = client.messages.batches.list(limit=limit)
+        batches = []
+        for batch in result:
+            entry: dict[str, Any] = {
+                "batch_id": batch.id,
+                "status": batch.processing_status,
+                "created_at": str(batch.created_at),
+            }
+            if batch.request_counts:
+                entry["request_counts"] = {
+                    "processing": batch.request_counts.processing,
+                    "succeeded": batch.request_counts.succeeded,
+                    "errored": batch.request_counts.errored,
+                    "canceled": batch.request_counts.canceled,
+                    "expired": batch.request_counts.expired,
+                }
+            if batch.ended_at:
+                entry["ended_at"] = str(batch.ended_at)
+            batches.append(entry)
+        return {"count": len(batches), "batches": batches}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_batch_results(batch_id: str) -> dict[str, Any]:
+    """Get results from a completed message batch.
+
+    Extracts text content from succeeded results. Only works on batches
+    with processing_status "ended".
+
+    Args:
+        batch_id: The batch ID to get results for.
+    """
+    try:
+        client = get_client()
+        results = []
+        for entry in client.messages.batches.results(batch_id):
+            item: dict[str, Any] = {"custom_id": entry.custom_id}
+            if entry.result.type == "succeeded":
+                # Extract text from content blocks
+                text_parts = []
+                thinking_parts = []
+                for block in entry.result.message.content:
+                    if block.type == "text":
+                        text_parts.append(block.text)
+                    elif block.type == "thinking":
+                        thinking_parts.append(block.thinking)
+                item["status"] = "succeeded"
+                item["text"] = "\n".join(text_parts)
+                if thinking_parts:
+                    item["thinking"] = "\n\n".join(thinking_parts)
+                item["usage"] = {
+                    "input_tokens": entry.result.message.usage.input_tokens,
+                    "output_tokens": entry.result.message.usage.output_tokens,
+                }
+            elif entry.result.type == "errored":
+                item["status"] = "errored"
+                item["error"] = str(entry.result.error)
+            elif entry.result.type == "canceled":
+                item["status"] = "canceled"
+            elif entry.result.type == "expired":
+                item["status"] = "expired"
+            results.append(item)
+        return {"count": len(results), "results": results}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def cancel_batch(batch_id: str) -> dict[str, Any]:
+    """Cancel a message batch that is still processing.
+
+    Already-completed requests in the batch are not affected.
+
+    Args:
+        batch_id: The batch ID to cancel.
+    """
+    try:
+        client = get_client()
+        result = client.messages.batches.cancel(batch_id)
+        return {
+            "batch_id": result.id,
+            "status": result.processing_status,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -843,7 +1119,10 @@ def server_info() -> dict[str, Any]:
         "description": "your pal Claude - MCP server for Claude consultation",
         "default_model": "opus",
         "supported_models": ["opus", "sonnet", "haiku"],
-        "features": ["extended_thinking", "vision", "stateful_sessions"],
+        "features": [
+            "extended_thinking", "adaptive_thinking", "vision",
+            "stateful_sessions", "batch", "token_counting", "effort",
+        ],
     }
 
 
@@ -859,6 +1138,7 @@ def models_resource() -> dict[str, Any]:
                 "description": "Deep reasoning, hard problems",
                 "default_tool_calls": DEFAULT_TOOL_CALLS["opus"],
                 "extended_thinking": True,
+                "adaptive_thinking": _is_opus_46(aliases["opus"]),
             },
             "sonnet": {
                 "id": aliases["sonnet"],
@@ -870,7 +1150,7 @@ def models_resource() -> dict[str, Any]:
                 "id": aliases["haiku"],
                 "description": "Fast exploration, quick questions",
                 "default_tool_calls": DEFAULT_TOOL_CALLS["haiku"],
-                "extended_thinking": False,
+                "extended_thinking": True,
             },
         },
     }
@@ -886,6 +1166,7 @@ def get_limits() -> dict[str, Any]:
         "max_search_matches": MAX_SEARCH_MATCHES,
         "session_ttl_seconds": SESSION_TTL,
         "thinking_budget_range": [1000, 100000],
+        "thinking_budget_note": "Adaptive thinking (Opus 4.6) ignores budget — model decides autonomously",
     }
 
 
