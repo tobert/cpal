@@ -15,6 +15,7 @@ import os
 import sys
 import threading
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -215,7 +216,7 @@ def _validate_path(path: str) -> Path:
         raise ValueError(f"Invalid path '{path}': {e}")
 
 
-SYSTEM_PROMPT = """\
+DEFAULT_SYSTEM_PROMPT = """\
 You are a consultant AI accessed via the Model Context Protocol (MCP).
 Your role is to provide high-agency, deep reasoning and analysis on tasks,
 usually in git repositories.
@@ -226,6 +227,101 @@ Use them proactively to explore the codebase—don't guess when you can verify.
 You have a large context window. Read files and gather complete context
 before providing your analysis.
 """
+
+# Composed system prompt — set by main(), defaults to built-in
+_system_prompt: str = DEFAULT_SYSTEM_PROMPT
+_system_prompt_sources: list[str] = ["built-in"]
+
+
+def _load_config() -> dict:
+    """Load config from $XDG_CONFIG_HOME/cpal/config.toml (or ~/.config/cpal/config.toml).
+
+    Returns parsed dict, or empty dict if file doesn't exist.
+    Logs a warning on parse errors (non-fatal).
+    """
+    config_home = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    config_path = Path(config_home) / "cpal" / "config.toml"
+
+    if not config_path.is_file():
+        logger.debug("No config file at %s", config_path)
+        return {}
+
+    try:
+        with open(config_path, "rb") as f:
+            config = tomllib.load(f)
+        logger.info("Loaded config from %s", config_path)
+        return config
+    except tomllib.TOMLDecodeError as e:
+        logger.warning("Invalid TOML in %s: %s", config_path, e)
+        return {}
+
+
+def _build_system_prompt(
+    config: dict,
+    cli_prompt_files: list[str] | None = None,
+    no_default: bool = False,
+) -> tuple[str, list[str]]:
+    """Compose the system prompt from config, files, and CLI flags.
+
+    Returns (prompt_text, list_of_sources) where sources describes
+    provenance for debugging.
+
+    Composition order:
+    1. Built-in default (unless suppressed)
+    2. Files from config.toml system_prompts list
+    3. Inline system_prompt from config.toml
+    4. Files from --system-prompt CLI flags
+    """
+    parts: list[str] = []
+    sources: list[str] = []
+
+    # 1. Built-in default (unless suppressed)
+    include_default = config.get("include_default_prompt", True)
+    if no_default:
+        include_default = False
+
+    if include_default:
+        parts.append(DEFAULT_SYSTEM_PROMPT.strip())
+        sources.append("built-in")
+
+    # 2. Files from config.toml system_prompts list
+    config_prompts = config.get("system_prompts", [])
+    if not isinstance(config_prompts, list):
+        logger.warning("Config 'system_prompts' must be a list, got %s", type(config_prompts).__name__)
+        config_prompts = []
+    for path_str in config_prompts:
+        expanded = Path(os.path.expandvars(os.path.expanduser(path_str)))
+        try:
+            content = expanded.read_text(encoding="utf-8")
+            parts.append(content.strip())
+            sources.append(str(expanded))
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning("Error reading system prompt %s: %s", expanded, e)
+
+    # 3. Inline system_prompt from config.toml
+    inline = config.get("system_prompt")
+    if inline and isinstance(inline, str):
+        parts.append(inline.strip())
+        sources.append("config.toml (inline)")
+
+    # 4. CLI --system-prompt files
+    for path_str in cli_prompt_files or []:
+        expanded = Path(os.path.expandvars(os.path.expanduser(path_str)))
+        try:
+            content = expanded.read_text(encoding="utf-8")
+            parts.append(content.strip())
+            sources.append(f"--system-prompt {expanded}")
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning("Error reading CLI system prompt %s: %s", expanded, e)
+
+    if not parts:
+        # Fallback: if everything was suppressed and no files provided,
+        # use the default anyway to avoid an empty prompt
+        parts.append(DEFAULT_SYSTEM_PROMPT.strip())
+        sources.append("built-in (fallback)")
+
+    return "\n\n".join(parts), sources
+
 
 # Beta header for 1M context window (tier 4+ orgs, premium pricing above 200K)
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
@@ -593,7 +689,7 @@ def run_agentic_loop(
     kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": 16384,
-        "system": SYSTEM_PROMPT,
+        "system": _system_prompt,
         "messages": messages,
         "tools": CLAUDE_TOOLS,
     }
@@ -925,7 +1021,7 @@ def count_tokens(
         kwargs: dict[str, Any] = {
             "model": model_id,
             "messages": [{"role": "user", "content": content}],
-            "system": system or SYSTEM_PROMPT,
+            "system": system or _system_prompt,
             "tools": CLAUDE_TOOLS,
         }
 
@@ -994,7 +1090,7 @@ def create_batch(
             params: dict[str, Any] = {
                 "model": model_id,
                 "max_tokens": max_tokens,
-                "system": system or SYSTEM_PROMPT,
+                "system": system or _system_prompt,
                 "messages": [{"role": "user", "content": query}],
             }
 
@@ -1183,6 +1279,10 @@ def server_info() -> dict[str, Any]:
             "stateful_sessions", "batch", "token_counting", "effort",
             "context_1m",
         ],
+        "system_prompt": {
+            "sources": _system_prompt_sources,
+            "length_chars": len(_system_prompt),
+        },
     }
 
 
@@ -1299,7 +1399,7 @@ def internal_tools() -> dict[str, Any]:
 
 
 def main() -> None:
-    global _api_key, _project_root
+    global _api_key, _project_root, _system_prompt, _system_prompt_sources
 
     # Configure logging
     logging.basicConfig(
@@ -1320,6 +1420,18 @@ def main() -> None:
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--system-prompt",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="Additional system prompt file (repeatable, appended after config)",
+    )
+    parser.add_argument(
+        "--no-default-prompt",
+        action="store_true",
+        help="Exclude the built-in default system prompt",
+    )
     args = parser.parse_args()
 
     if args.debug:
@@ -1330,6 +1442,15 @@ def main() -> None:
             print(f"Error: Key file not found: {args.key_file}", file=sys.stderr)
             sys.exit(1)
         _api_key = args.key_file.read_text().strip()
+
+    # Load config and compose system prompt
+    config = _load_config()
+    _system_prompt, _system_prompt_sources = _build_system_prompt(
+        config,
+        cli_prompt_files=args.system_prompt,
+        no_default=args.no_default_prompt,
+    )
+    logger.info("System prompt sources: %s", _system_prompt_sources)
 
     # Capture project root at startup before CWD can change
     _project_root = Path.cwd().resolve()
