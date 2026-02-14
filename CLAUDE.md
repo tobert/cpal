@@ -183,11 +183,44 @@ ANTHROPIC_API_KEY= uv run pytest tests/ -v
 
 ## Configuration
 
+### CLI Options
+
 | Option | Description |
 |--------|-------------|
 | `--key-file PATH` | Read API key from file (recommended) |
 | `--debug` | Enable debug logging |
+| `--system-prompt FILE` | Additional system prompt file (repeatable) |
+| `--no-default-prompt` | Exclude the built-in default system prompt |
 | `ANTHROPIC_API_KEY` | Fallback if `--key-file` not specified |
+
+### Config File: `~/.config/cpal/config.toml`
+
+Uses `$XDG_CONFIG_HOME/cpal/config.toml` (falls back to `~/.config/cpal/config.toml`).
+Parsed with Python 3.12 stdlib `tomllib` — no extra dependency.
+
+```toml
+# System prompt files, loaded in order and concatenated
+system_prompts = [
+    "~/.config/cpal/CLAUDE.md",
+]
+
+# Inline system prompt text (appended after files)
+# system_prompt = "常に日本語で回答してください (Always respond in Japanese)"
+
+# If true (default), prepend the built-in cpal system prompt.
+# Set to false to fully replace it with your own.
+# include_default_prompt = true
+```
+
+Paths support `~` and `$ENV_VAR` expansion.
+
+**Composition order:**
+1. Built-in `DEFAULT_SYSTEM_PROMPT` (if `include_default_prompt` is true and `--no-default-prompt` not set)
+2. Files from `system_prompts` list (in order)
+3. Inline `system_prompt` from config.toml
+4. Files from `--system-prompt` CLI flags (in order)
+
+All joined with `\n\n`. Provenance visible in `resource://server/info`.
 
 ## Differences from gpal
 
