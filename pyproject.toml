@@ -1,6 +1,6 @@
 [project]
 name = "cpal"
-version = "0.2.2"
+version = "0.2.3"
 description = "An MCP server providing stateful Claude access with extended thinking and tool use"
 readme = "README.md"
 license = "MIT"

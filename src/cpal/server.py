@@ -712,8 +712,8 @@ def run_agentic_loop(
             # Manual thinking requires higher max_tokens
             kwargs["max_tokens"] = max(kwargs["max_tokens"], thinking_budget + 8000)
 
-    # Effort parameter (API validates model support)
-    if effort is not None:
+    # Effort parameter (only Opus supports it)
+    if effort is not None and _is_opus_46(model):
         kwargs.setdefault("output_config", {})["effort"] = effort
 
     thinking_enabled = "thinking" in kwargs
@@ -1104,7 +1104,7 @@ def create_batch(
                     }
                     params["max_tokens"] = max(max_tokens, thinking_budget + 8000)
 
-            if effort is not None:
+            if effort is not None and _is_opus_46(model_id):
                 params.setdefault("output_config", {})["effort"] = effort
 
             requests.append({
