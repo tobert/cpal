@@ -156,6 +156,48 @@ MCP Client (Gemini, Cursor, etc.)
     • search_project
 ```
 
+## Custom System Prompts
+
+Customize what Claude "knows" about you, your project, or your workflow by composing system prompts from multiple sources.
+
+**Config file** (`~/.config/cpal/config.toml`):
+
+```toml
+# Files loaded in order and concatenated
+system_prompts = [
+    "~/.config/cpal/CLAUDE.md",
+]
+
+# Inline text appended after files
+# system_prompt = "Always respond in Japanese"
+
+# Set to false to fully replace the built-in prompt with your own
+# include_default_prompt = true
+```
+
+Paths support `~` and `$ENV_VAR` expansion, so you can use `$WORKSPACE/CLAUDE.md` etc.
+
+**CLI flags** (repeatable, concatenated in order):
+
+```bash
+# Append additional prompt files
+cpal --system-prompt /path/to/project-context.md
+
+# Multiple files
+cpal --system-prompt ~/CLAUDE.md --system-prompt ./PROJECT.md
+
+# Replace the built-in prompt entirely
+cpal --system-prompt ~/my-prompt.md --no-default-prompt
+```
+
+**Composition order:**
+1. Built-in cpal system prompt (unless `include_default_prompt = false` or `--no-default-prompt`)
+2. Files from `system_prompts` in config.toml
+3. Inline `system_prompt` from config.toml
+4. Files from `--system-prompt` CLI flags
+
+Check what's active via `resource://server/info` — it shows which sources contributed and the total prompt length.
+
 ## Security
 
 - All file access is sandboxed to the directory where cpal was started
