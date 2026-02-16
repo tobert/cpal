@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 from cpal import __version__
+from cpal.git_tools import GIT_TOOL_SCHEMA, execute_git
 
 load_dotenv()
 
@@ -221,8 +222,9 @@ You are a consultant AI accessed via the Model Context Protocol (MCP).
 Your role is to provide high-agency, deep reasoning and analysis on tasks,
 usually in git repositories.
 
-You have tools: list_directory, read_file, and search_project.
+You have tools: list_directory, read_file, search_project, and git.
 Use them proactively to explore the codebase—don't guess when you can verify.
+The git tool provides read-only access to status, diff, log, and show.
 
 You have a large context window. Read files and gather complete context
 before providing your analysis.
@@ -427,6 +429,7 @@ CLAUDE_TOOLS = [
             "required": ["search_term"],
         },
     },
+    GIT_TOOL_SCHEMA,
 ]
 
 
@@ -513,6 +516,9 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
             return "\n".join(matches) if matches else "No matches found."
         except Exception as e:
             return f"Error searching project: {e}"
+
+    elif name == "git":
+        return execute_git(input_data)
 
     return f"Unknown tool: {name}"
 
@@ -1383,6 +1389,10 @@ def internal_tools() -> dict[str, Any]:
             {
                 "name": "search_project",
                 "description": "Search for text in files matching glob pattern",
+            },
+            {
+                "name": "git",
+                "description": "Read-only git operations (status, diff, log, show)",
             },
         ],
         "security": {
