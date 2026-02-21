@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="contrib/cpal-logo.svg" width="128" height="128" alt="cpal logo">
+</p>
+
 # cpal - your pal Claude
 
 An MCP server that lets any AI consult Claude.
