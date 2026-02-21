@@ -8,6 +8,7 @@ extended thinking and autonomous codebase exploration capabilities.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import glob as globlib
 import logging
@@ -21,18 +22,23 @@ from typing import Any
 
 import anthropic
 from dotenv import load_dotenv
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 
 from cpal import __version__
 from cpal.git_tools import GIT_TOOL_SCHEMA, execute_git
 
 load_dotenv()
 
+# Tool annotations for MCP clients
+READONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
+CANCEL_ANNOTATIONS = ToolAnnotations(destructiveHint=True)
+
 # Module-level API key (set via --key-file or environment)
 _api_key: str | None = None
 
-# Cached Anthropic client (thread-safe lazy init)
-_client: anthropic.Anthropic | None = None
+# Cached Anthropic client (lazy init)
+_client: anthropic.AsyncAnthropic | None = None
 _client_lock = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,10 +79,10 @@ KNOWN_TIERS = {"haiku", "sonnet", "opus"}
 
 # Lazy-init cache for discovered models
 _discovered_models: dict[str, str] | None = None
-_models_lock = threading.Lock()
+_models_lock = asyncio.Lock()
 
 
-def _fetch_latest_models() -> dict[str, str] | None:
+async def _fetch_latest_models() -> dict[str, str] | None:
     """Fetch latest model versions from Anthropic API.
 
     Matches model IDs by substring (e.g. 'claude-opus' in ID),
@@ -85,11 +91,10 @@ def _fetch_latest_models() -> dict[str, str] | None:
     """
     try:
         client = get_client()
-        response = client.models.list(limit=1000)
 
         latest: dict[str, tuple[Any, str]] = {}  # tier → (created_at, model_id)
 
-        for model in response:  # auto-paginates
+        async for model in client.models.list(limit=1000):
             for tier in KNOWN_TIERS:
                 if f"claude-{tier}" in model.id:
                     if tier not in latest or model.created_at > latest[tier][0]:
@@ -110,20 +115,20 @@ def _fetch_latest_models() -> dict[str, str] | None:
         return None
 
 
-def get_model_aliases() -> dict[str, str]:
+async def get_model_aliases() -> dict[str, str]:
     """Get model aliases, fetching from API on first call.
 
-    Thread-safe with double-checked locking. Only caches successful
+    Double-checked locking with asyncio.Lock. Only caches successful
     discovery — fallback results are never cached so the next call
     retries the API.
     """
     global _discovered_models
     if _discovered_models is not None:
         return _discovered_models
-    with _models_lock:
+    async with _models_lock:
         if _discovered_models is not None:
             return _discovered_models
-        result = _fetch_latest_models()
+        result = await _fetch_latest_models()
         if result is not None:
             _discovered_models = result
             return _discovered_models
@@ -338,8 +343,9 @@ mcp = FastMCP("cpal")
 # Format: {session_id: {"messages": [...], "model": "...", "last_access": timestamp}}
 sessions: dict[str, dict[str, Any]] = {}
 
-# Thread safety for concurrent session access
-_session_locks: dict[str, threading.Lock] = {}
+# Concurrency: asyncio.Lock for locks held across await boundaries,
+# threading.Lock for quick in-memory dict operations (no awaits inside).
+_session_locks: dict[str, asyncio.Lock] = {}
 _locks_lock = threading.Lock()
 _sessions_lock = threading.Lock()  # Protects sessions dict structure
 
@@ -347,11 +353,11 @@ _sessions_lock = threading.Lock()  # Protects sessions dict structure
 logger = logging.getLogger("cpal")
 
 
-def get_session_lock(session_id: str) -> threading.Lock:
-    """Get or create a lock for a session."""
+def get_session_lock(session_id: str) -> asyncio.Lock:
+    """Get or create an async lock for a session."""
     with _locks_lock:
         if session_id not in _session_locks:
-            _session_locks[session_id] = threading.Lock()
+            _session_locks[session_id] = asyncio.Lock()
         return _session_locks[session_id]
 
 
@@ -528,11 +534,11 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_client() -> anthropic.Anthropic:
-    """Get or create a cached Anthropic API client.
+def get_client() -> anthropic.AsyncAnthropic:
+    """Get or create a cached async Anthropic API client.
 
     Double-checked locking ensures thread safety without contention
-    on the hot path.
+    on the hot path. Client creation is synchronous (just object init).
     """
     global _client
     if _client is not None:
@@ -545,13 +551,14 @@ def get_client() -> anthropic.Anthropic:
             raise ValueError(
                 "No API key found. Use --key-file or set ANTHROPIC_API_KEY."
             )
-        _client = anthropic.Anthropic(api_key=api_key)
+        _client = anthropic.AsyncAnthropic(api_key=api_key)
         return _client
 
 
-def get_session(session_id: str, model_alias: str) -> dict[str, Any]:
+async def get_session(session_id: str, model_alias: str) -> dict[str, Any]:
     """Get or create a session, migrating history when switching models."""
-    target_model = get_model_aliases().get(model_alias.lower(), model_alias)
+    aliases = await get_model_aliases()
+    target_model = aliases.get(model_alias.lower(), model_alias)
 
     with _sessions_lock:
         # Periodically cleanup old sessions (cheap check)
@@ -676,8 +683,8 @@ def _filter_thinking_blocks(content: list, thinking_enabled: bool) -> list:
     ]
 
 
-def run_agentic_loop(
-    client: anthropic.Anthropic,
+async def run_agentic_loop(
+    client: anthropic.AsyncAnthropic,
     model: str,
     messages: list[dict[str, Any]],
     extended_thinking: bool = True,
@@ -685,10 +692,12 @@ def run_agentic_loop(
     max_tool_calls: int = 25,
     effort: str | None = None,
     context_1m: bool = False,
+    ctx: Context | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """
     Run Claude with tool use, executing tools until we get a final response.
 
+    Reports progress via ctx (MCP Context) when provided.
     Returns (response_text, updated_messages).
     """
     # Build request kwargs
@@ -730,7 +739,7 @@ def run_agentic_loop(
     tool_call_count = 0
 
     while tool_call_count < max_tool_calls:
-        response = create_fn(**kwargs)
+        response = await create_fn(**kwargs)
 
         # Check if we're done (no tool use)
         if response.stop_reason == "end_turn":
@@ -745,6 +754,9 @@ def run_agentic_loop(
 
             # Add final assistant response to history (filter thinking blocks)
             messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
+
+            if ctx:
+                await ctx.report_progress(max_tool_calls, max_tool_calls, "Complete")
 
             # Include thinking if present
             if thinking_parts:
@@ -769,6 +781,9 @@ def run_agentic_loop(
                         "tool_use_id": block.id,
                         "content": result,
                     })
+                    if ctx:
+                        await ctx.report_progress(tool_call_count, max_tool_calls)
+                        await ctx.info(f"Tool call {tool_call_count}: {block.name}")
 
             # Add tool results
             messages.append({"role": "user", "content": tool_results})
@@ -818,7 +833,7 @@ def run_agentic_loop(
     return error_msg, messages
 
 
-def _consult(
+async def _consult(
     query: str,
     session_id: str,
     model_alias: str,
@@ -828,6 +843,7 @@ def _consult(
     thinking_budget: int = 10000,
     effort: str | None = None,
     context_1m: bool = False,
+    ctx: Context | None = None,
 ) -> str:
     """Send a query to Claude with optional file/media context."""
     # Input validation
@@ -861,10 +877,10 @@ def _consult(
 
     client = get_client()
 
-    # Use session lock to prevent concurrent access corruption
+    # Use async session lock to prevent concurrent access corruption
     lock = get_session_lock(session_id)
-    with lock:
-        session = get_session(session_id, model_alias)
+    async with lock:
+        session = await get_session(session_id, model_alias)
         model = session["model"]
 
         max_tool_calls = DEFAULT_TOOL_CALLS.get(model_alias.lower(), 1000)
@@ -878,7 +894,7 @@ def _consult(
         current_messages.append({"role": "user", "content": content})
 
         try:
-            response_text, updated_messages = run_agentic_loop(
+            response_text, updated_messages = await run_agentic_loop(
                 client,
                 model,
                 current_messages,
@@ -887,6 +903,7 @@ def _consult(
                 max_tool_calls=max_tool_calls,
                 effort=effort,
                 context_1m=context_1m,
+                ctx=ctx,
             )
             # Only update session on success; prune to prevent unbounded growth
             if len(updated_messages) > MAX_SESSION_MESSAGES:
@@ -908,8 +925,8 @@ def _consult(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
-def consult_claude(
+@mcp.tool(annotations=READONLY, timeout=600.0)
+async def consult_claude(
     query: str,
     session_id: str = "default",
     model: str = "opus",
@@ -919,6 +936,7 @@ def consult_claude(
     thinking_budget: int = 10000,
     effort: str | None = None,
     context_1m: bool = False,
+    ctx: Context | None = None,
 ) -> str:
     """
     Consult Claude for logical precision, planning, and focused analysis.
@@ -952,20 +970,20 @@ def consult_claude(
         context_1m: Enable 1M token context window (beta, tier 4+, premium pricing above 200K).
     """
     logger.debug(f"consult_claude: session={session_id}, model={model}")
-    return _consult(
+    return await _consult(
         query, session_id, model, file_paths, media_paths,
-        extended_thinking, thinking_budget, effort, context_1m
+        extended_thinking, thinking_budget, effort, context_1m, ctx
     )
 
 
-@mcp.tool()
-def list_models() -> dict[str, Any]:
+@mcp.tool(annotations=READONLY, timeout=30.0)
+async def list_models() -> dict[str, Any]:
     """List available Claude models.
 
     Returns model aliases (haiku, sonnet, opus) mapped to their
     current versioned model IDs, with metadata about each tier.
     """
-    aliases = get_model_aliases()
+    aliases = await get_model_aliases()
     return {
         "default": "opus",
         "models": {
@@ -985,8 +1003,8 @@ def list_models() -> dict[str, Any]:
     }
 
 
-@mcp.tool()
-def count_tokens(
+@mcp.tool(annotations=READONLY, timeout=30.0)
+async def count_tokens(
     query: str,
     model: str = "opus",
     system: str | None = None,
@@ -1019,7 +1037,7 @@ def count_tokens(
                     return {"error": f"Error accessing '{path}': {e}"}
 
         client = get_client()
-        aliases = get_model_aliases()
+        aliases = await get_model_aliases()
         model_id = aliases.get(model.lower(), model)
 
         content = build_content_blocks(query, file_paths)
@@ -1040,8 +1058,7 @@ def count_tokens(
                 "budget_tokens": thinking_budget,
             }
 
-        count_fn = client.messages.count_tokens
-        result = count_fn(**kwargs)
+        result = await client.messages.count_tokens(**kwargs)
         return {"input_tokens": result.input_tokens, "model": model_id}
     except Exception as e:
         return {"error": str(e)}
@@ -1052,8 +1069,8 @@ def count_tokens(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
-def create_batch(
+@mcp.tool(annotations=READONLY, timeout=30.0)
+async def create_batch(
     queries: list[dict[str, str]],
     model: str = "opus",
     system: str | None = None,
@@ -1083,7 +1100,7 @@ def create_batch(
     """
     try:
         client = get_client()
-        aliases = get_model_aliases()
+        aliases = await get_model_aliases()
         model_id = aliases.get(model.lower(), model)
 
         requests = []
@@ -1119,11 +1136,11 @@ def create_batch(
             })
 
         if context_1m:
-            result = client.beta.messages.batches.create(
+            result = await client.beta.messages.batches.create(
                 requests=requests, betas=[CONTEXT_1M_BETA],
             )
         else:
-            result = client.messages.batches.create(requests=requests)
+            result = await client.messages.batches.create(requests=requests)
         return {
             "batch_id": result.id,
             "status": result.processing_status,
@@ -1134,8 +1151,8 @@ def create_batch(
         return {"error": str(e)}
 
 
-@mcp.tool()
-def get_batch(batch_id: str) -> dict[str, Any]:
+@mcp.tool(annotations=READONLY, timeout=30.0)
+async def get_batch(batch_id: str) -> dict[str, Any]:
     """Get the status of a message batch.
 
     Args:
@@ -1143,7 +1160,7 @@ def get_batch(batch_id: str) -> dict[str, Any]:
     """
     try:
         client = get_client()
-        result = client.messages.batches.retrieve(batch_id)
+        result = await client.messages.batches.retrieve(batch_id)
         response: dict[str, Any] = {
             "batch_id": result.id,
             "status": result.processing_status,
@@ -1164,8 +1181,8 @@ def get_batch(batch_id: str) -> dict[str, Any]:
         return {"error": str(e)}
 
 
-@mcp.tool()
-def list_batches(limit: int = 20) -> dict[str, Any]:
+@mcp.tool(annotations=READONLY, timeout=30.0)
+async def list_batches(limit: int = 20) -> dict[str, Any]:
     """List recent message batches (restart-safe, queries API directly).
 
     Anthropic retains batch metadata for 29 days. There is no API to delete
@@ -1177,9 +1194,8 @@ def list_batches(limit: int = 20) -> dict[str, Any]:
     try:
         limit = max(1, min(limit, 100))  # Clamp to valid range
         client = get_client()
-        result = client.messages.batches.list(limit=limit)
         batches = []
-        for batch in result:
+        async for batch in client.messages.batches.list(limit=limit):
             entry: dict[str, Any] = {
                 "batch_id": batch.id,
                 "status": batch.processing_status,
@@ -1201,8 +1217,8 @@ def list_batches(limit: int = 20) -> dict[str, Any]:
         return {"error": str(e)}
 
 
-@mcp.tool()
-def get_batch_results(batch_id: str) -> dict[str, Any]:
+@mcp.tool(annotations=READONLY, timeout=60.0)
+async def get_batch_results(batch_id: str) -> dict[str, Any]:
     """Get results from a completed message batch.
 
     Extracts text content from succeeded results. Only works on batches
@@ -1214,7 +1230,7 @@ def get_batch_results(batch_id: str) -> dict[str, Any]:
     try:
         client = get_client()
         results = []
-        for entry in client.messages.batches.results(batch_id):
+        async for entry in client.messages.batches.results(batch_id):
             item: dict[str, Any] = {"custom_id": entry.custom_id}
             if entry.result.type == "succeeded":
                 # Extract text from content blocks
@@ -1246,8 +1262,8 @@ def get_batch_results(batch_id: str) -> dict[str, Any]:
         return {"error": str(e)}
 
 
-@mcp.tool()
-def cancel_batch(batch_id: str) -> dict[str, Any]:
+@mcp.tool(annotations=CANCEL_ANNOTATIONS, timeout=30.0)
+async def cancel_batch(batch_id: str) -> dict[str, Any]:
     """Cancel a message batch that is still processing.
 
     Already-completed requests in the batch are not affected.
@@ -1257,7 +1273,7 @@ def cancel_batch(batch_id: str) -> dict[str, Any]:
     """
     try:
         client = get_client()
-        result = client.messages.batches.cancel(batch_id)
+        result = await client.messages.batches.cancel(batch_id)
         return {
             "batch_id": result.id,
             "status": result.processing_status,
@@ -1293,9 +1309,9 @@ def server_info() -> dict[str, Any]:
 
 
 @mcp.resource("resource://models")
-def models_resource() -> dict[str, Any]:
+async def models_resource() -> dict[str, Any]:
     """Available Claude models and their characteristics."""
-    aliases = get_model_aliases()
+    aliases = await get_model_aliases()
     return {
         "default": "opus",
         "models": {

@@ -281,7 +281,8 @@ class TestSearchWithLineNumbers:
 class TestModelDiscovery:
     """Tests for dynamic model discovery."""
 
-    def test_fetch_returns_none_when_no_api_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_fetch_returns_none_when_no_api_key(self, monkeypatch):
         """_fetch_latest_models returns None when API unavailable."""
         import cpal.server as srv
         monkeypatch.setattr(srv, "_api_key", None)
@@ -289,9 +290,10 @@ class TestModelDiscovery:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setattr(srv, "_discovered_models", None)
 
-        assert srv._fetch_latest_models() is None
+        assert await srv._fetch_latest_models() is None
 
-    def test_get_aliases_falls_back_when_no_api_key(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_get_aliases_falls_back_when_no_api_key(self, monkeypatch):
         """get_model_aliases returns fallbacks when discovery fails."""
         import cpal.server as srv
         monkeypatch.setattr(srv, "_api_key", None)
@@ -299,12 +301,13 @@ class TestModelDiscovery:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setattr(srv, "_discovered_models", None)
 
-        result = srv.get_model_aliases()
+        result = await srv.get_model_aliases()
         assert "opus" in result
         assert "sonnet" in result
         assert "haiku" in result
 
-    def test_fallback_not_cached(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_fallback_not_cached(self, monkeypatch):
         """Fallback results are not cached, so next call retries."""
         import cpal.server as srv
         monkeypatch.setattr(srv, "_api_key", None)
@@ -312,15 +315,16 @@ class TestModelDiscovery:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setattr(srv, "_discovered_models", None)
 
-        srv.get_model_aliases()
+        await srv.get_model_aliases()
         assert srv._discovered_models is None
 
-    def test_get_model_aliases_caches(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_get_model_aliases_caches(self, monkeypatch):
         """Second call returns cached result without re-fetching."""
         import cpal.server as srv
         monkeypatch.setattr(srv, "_discovered_models", {"opus": "test-model"})
 
-        result = srv.get_model_aliases()
+        result = await srv.get_model_aliases()
         assert result == {"opus": "test-model"}
 
     def test_fallback_aliases_are_valid(self):
@@ -331,9 +335,10 @@ class TestModelDiscovery:
 
 
 class TestCleanupPreservesHeldLocks:
-    """Tests that session cleanup preserves locks held by other threads."""
+    """Tests that session cleanup preserves locks held by other coroutines."""
 
-    def test_cleanup_preserves_held_locks(self):
+    @pytest.mark.asyncio
+    async def test_cleanup_preserves_held_locks(self):
         """Lock objects should survive cleanup if currently held."""
         import time as time_module
 
@@ -345,7 +350,7 @@ class TestCleanupPreservesHeldLocks:
         }
         # Grab AND hold the lock before cleanup
         lock_before = get_session_lock(test_sid)
-        lock_before.acquire()
+        await lock_before.acquire()
 
         try:
             cleanup_old_sessions()
@@ -364,9 +369,10 @@ class TestCleanupPreservesHeldLocks:
 class TestPathTraversalInConsult:
     """Tests that _consult blocks path traversal via file_paths/media_paths."""
 
-    def test_file_path_traversal_blocked(self):
+    @pytest.mark.asyncio
+    async def test_file_path_traversal_blocked(self):
         """file_paths pointing outside project should be rejected."""
-        result = _consult(
+        result = await _consult(
             query="test",
             session_id="test-traversal",
             model_alias="opus",
@@ -375,9 +381,10 @@ class TestPathTraversalInConsult:
         assert "Error" in result
         assert "outside project" in result
 
-    def test_media_path_traversal_blocked(self):
+    @pytest.mark.asyncio
+    async def test_media_path_traversal_blocked(self):
         """media_paths pointing outside project should be rejected."""
-        result = _consult(
+        result = await _consult(
             query="test",
             session_id="test-traversal-media",
             model_alias="opus",
@@ -510,7 +517,8 @@ class TestFallbackAliasesOpus46:
 class TestPartialModelDiscovery:
     """Tests that partial model discovery merges into fallbacks."""
 
-    def test_partial_discovery_merges(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_partial_discovery_merges(self, monkeypatch):
         """If API returns only opus, haiku and sonnet should use fallbacks."""
         import cpal.server as srv
         # Simulate partial discovery returning only opus
@@ -519,14 +527,15 @@ class TestPartialModelDiscovery:
             "sonnet": "claude-sonnet-4-5-20250929",
             # haiku missing — should NOT crash
         })
-        result = srv.get_model_aliases()
+        result = await srv.get_model_aliases()
         # Should still have all three tiers
         assert "opus" in result
         assert "sonnet" in result
         # haiku comes from cached result (which is what _discovered_models is)
         # The real fix is in _fetch_latest_models merging into fallbacks
 
-    def test_fetch_merges_into_fallbacks(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_fetch_merges_into_fallbacks(self, monkeypatch):
         """_fetch_latest_models should merge partial results into fallbacks."""
         import cpal.server as srv
 
@@ -535,20 +544,32 @@ class TestPartialModelDiscovery:
                 self.id = model_id
                 self.created_at = created_at
 
-        class FakeResponse:
-            def __iter__(self):
-                return iter([FakeModel("claude-opus-4-6", "2026-01-01")])
+        class FakeAsyncIterator:
+            """Async iterator over fake model objects."""
+            def __init__(self, items):
+                self._items = items
+                self._index = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._index >= len(self._items):
+                    raise StopAsyncIteration
+                item = self._items[self._index]
+                self._index += 1
+                return item
 
         class FakeModels:
             def list(self, limit=None):
-                return FakeResponse()
+                return FakeAsyncIterator([FakeModel("claude-opus-4-6", "2026-01-01")])
 
         class FakeClient:
             models = FakeModels()
 
         monkeypatch.setattr(srv, "_client", FakeClient())
 
-        result = srv._fetch_latest_models()
+        result = await srv._fetch_latest_models()
         assert result is not None
         # Should have opus from discovery AND haiku+sonnet from fallbacks
         assert "opus" in result
