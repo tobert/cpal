@@ -104,11 +104,14 @@ picking the newest version per tier by `created_at`. Hardcoded fallbacks
 are used when the API is unreachable. Fallback results are **not cached**,
 so the next call retries discovery.
 
-| Tier | Fallback ID | Best For |
-|------|-------------|----------|
-| `haiku` | `claude-haiku-4-5-20251001` | Fast exploration, quick questions |
-| `sonnet` | `claude-sonnet-4-5-20250929` | Balanced reasoning, code review |
-| `opus` | `claude-opus-4-5-20251101` | Deep analysis, hard problems (default) |
+| Tier | Best For |
+|------|----------|
+| `haiku` | Fast exploration, quick questions |
+| `sonnet` | Balanced reasoning, code review |
+| `opus` | Deep analysis, hard problems (default) |
+
+Hardcoded fallback IDs are in `FALLBACK_ALIASES` in `server.py` and should
+point to recent model versions. They're only used when API discovery fails.
 
 ### Extended Thinking
 
