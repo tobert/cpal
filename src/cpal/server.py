@@ -1217,7 +1217,7 @@ async def list_batches(limit: int = 20) -> dict[str, Any]:
         return {"error": str(e)}
 
 
-@mcp.tool(annotations=READONLY, timeout=60.0)
+@mcp.tool(annotations=READONLY, timeout=300.0)
 async def get_batch_results(batch_id: str) -> dict[str, Any]:
     """Get results from a completed message batch.
 
@@ -1230,36 +1230,47 @@ async def get_batch_results(batch_id: str) -> dict[str, Any]:
     try:
         client = get_client()
         results = []
-        async for entry in client.messages.batches.results(batch_id):
+        async for entry in await client.messages.batches.results(batch_id):
             item: dict[str, Any] = {"custom_id": entry.custom_id}
             if entry.result.type == "succeeded":
-                # Extract text from content blocks
                 text_parts = []
                 thinking_parts = []
+                other_types = []
                 for block in entry.result.message.content:
                     if block.type == "text":
                         text_parts.append(block.text)
                     elif block.type == "thinking":
                         thinking_parts.append(block.thinking)
+                    else:
+                        other_types.append(block.type)
                 item["status"] = "succeeded"
                 item["text"] = "\n".join(text_parts)
                 if thinking_parts:
                     item["thinking"] = "\n\n".join(thinking_parts)
+                if other_types:
+                    item["omitted_block_types"] = other_types
                 item["usage"] = {
                     "input_tokens": entry.result.message.usage.input_tokens,
                     "output_tokens": entry.result.message.usage.output_tokens,
                 }
             elif entry.result.type == "errored":
                 item["status"] = "errored"
-                item["error"] = str(entry.result.error)
+                err = entry.result.error
+                item["error"] = {"type": getattr(err, "type", None), "message": getattr(err, "message", str(err))}
             elif entry.result.type == "canceled":
                 item["status"] = "canceled"
             elif entry.result.type == "expired":
                 item["status"] = "expired"
+            else:
+                item["status"] = "unknown"
+                item["result_type"] = entry.result.type
             results.append(item)
         return {"count": len(results), "results": results}
-    except Exception as e:
-        return {"error": str(e)}
+    except anthropic.APIError as e:
+        result = {"error": f"{e.__class__.__name__}: {e.message}"}
+        if status_code := getattr(e, "status_code", None):
+            result["status_code"] = status_code
+        return result
 
 
 @mcp.tool(annotations=CANCEL_ANNOTATIONS, timeout=30.0)
