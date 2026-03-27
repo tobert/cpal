@@ -19,7 +19,7 @@ from cpal.server import (
     is_text_file,
     _validate_path,
     _filter_thinking_blocks,
-    _is_opus_46,
+    _supports_adaptive_thinking,
     _consult,
     sessions,
     _session_locks,
@@ -450,23 +450,29 @@ class TestFilterThinkingBlocks:
         assert len(result) == 2
 
 
-class TestIsOpus46:
-    """Tests for _is_opus_46 helper."""
+class TestSupportsAdaptiveThinking:
+    """Tests for _supports_adaptive_thinking helper."""
 
     def test_opus_46_bare(self):
-        assert _is_opus_46("claude-opus-4-6") is True
+        assert _supports_adaptive_thinking("claude-opus-4-6") is True
 
     def test_opus_46_with_date(self):
-        assert _is_opus_46("claude-opus-4-6-20260101") is True
+        assert _supports_adaptive_thinking("claude-opus-4-6-20260101") is True
+
+    def test_sonnet_46_bare(self):
+        assert _supports_adaptive_thinking("claude-sonnet-4-6") is True
+
+    def test_sonnet_46_with_date(self):
+        assert _supports_adaptive_thinking("claude-sonnet-4-6-20260201") is True
 
     def test_opus_45(self):
-        assert _is_opus_46("claude-opus-4-5-20251101") is False
+        assert _supports_adaptive_thinking("claude-opus-4-5-20251101") is False
 
-    def test_sonnet(self):
-        assert _is_opus_46("claude-sonnet-4-5-20250929") is False
+    def test_sonnet_45(self):
+        assert _supports_adaptive_thinking("claude-sonnet-4-5-20250929") is False
 
     def test_haiku(self):
-        assert _is_opus_46("claude-haiku-4-5-20251001") is False
+        assert _supports_adaptive_thinking("claude-haiku-4-5-20251001") is False
 
 
 class TestThinkingDefaults:
@@ -504,14 +510,23 @@ class TestThinkingDefaults:
         assert sig.parameters["effort"].default is None
 
 
-class TestFallbackAliasesOpus46:
-    """Test that opus fallback is now Opus 4.6."""
+class TestFallbackAliases:
+    """Test that fallback aliases point to expected models."""
 
     def test_opus_fallback_is_46(self):
         assert FALLBACK_ALIASES["opus"] == "claude-opus-4-6"
 
-    def test_opus_fallback_is_opus_46(self):
-        assert _is_opus_46(FALLBACK_ALIASES["opus"]) is True
+    def test_sonnet_fallback_is_46(self):
+        assert FALLBACK_ALIASES["sonnet"] == "claude-sonnet-4-6"
+
+    def test_opus_supports_adaptive(self):
+        assert _supports_adaptive_thinking(FALLBACK_ALIASES["opus"]) is True
+
+    def test_sonnet_supports_adaptive(self):
+        assert _supports_adaptive_thinking(FALLBACK_ALIASES["sonnet"]) is True
+
+    def test_haiku_no_adaptive(self):
+        assert _supports_adaptive_thinking(FALLBACK_ALIASES["haiku"]) is False
 
 
 class TestPartialModelDiscovery:
@@ -524,7 +539,7 @@ class TestPartialModelDiscovery:
         # Simulate partial discovery returning only opus
         monkeypatch.setattr(srv, "_discovered_models", {
             "opus": "claude-opus-4-6",
-            "sonnet": "claude-sonnet-4-5-20250929",
+            "sonnet": "claude-sonnet-4-6",
             # haiku missing — should NOT crash
         })
         result = await srv.get_model_aliases()

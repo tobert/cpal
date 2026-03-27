@@ -115,7 +115,9 @@ point to recent model versions. They're only used when API discovery fails.
 
 ### Extended Thinking
 
-Sonnet and Opus support extended thinking - explicit chain-of-thought reasoning:
+All tiers support extended thinking. Opus 4.6 and Sonnet 4.6 use **adaptive
+thinking** (model decides when/how much to think). Older models use manual
+thinking with an explicit `thinking_budget`:
 
 ```python
 consult_claude(

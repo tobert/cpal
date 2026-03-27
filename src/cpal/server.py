@@ -70,7 +70,7 @@ if _max_tool_calls_override is not None:
 
 FALLBACK_ALIASES: dict[str, str] = {
     "haiku": "claude-haiku-4-5-20251001",    # Haiku 4.5
-    "sonnet": "claude-sonnet-4-5-20250929",  # Sonnet 4.5
+    "sonnet": "claude-sonnet-4-6",           # Sonnet 4.6
     "opus": "claude-opus-4-6",               # Opus 4.6
 }
 
@@ -134,9 +134,9 @@ async def get_model_aliases() -> dict[str, str]:
             return _discovered_models
         return FALLBACK_ALIASES.copy()
 
-def _is_opus_46(model: str) -> bool:
-    """Check if model is Opus 4.6 (supports adaptive thinking)."""
-    return "claude-opus-4-6" in model
+def _supports_adaptive_thinking(model: str) -> bool:
+    """Check if model supports adaptive thinking (Opus 4.6+, Sonnet 4.6+)."""
+    return "claude-opus-4-6" in model or "claude-sonnet-4-6" in model
 
 
 # MIME type mappings for multimodal support
@@ -715,7 +715,7 @@ async def run_agentic_loop(
 
     # Thinking configuration — all models think by default
     if extended_thinking:
-        if _is_opus_46(model):
+        if _supports_adaptive_thinking(model):
             # Opus 4.6: adaptive thinking (model decides when/how much)
             kwargs["thinking"] = {"type": "adaptive"}
         else:
@@ -727,8 +727,8 @@ async def run_agentic_loop(
             # Manual thinking requires higher max_tokens
             kwargs["max_tokens"] = max(kwargs["max_tokens"], thinking_budget + 8000)
 
-    # Effort parameter (only Opus supports it)
-    if effort is not None and _is_opus_46(model):
+    # Effort parameter (models with adaptive thinking)
+    if effort is not None and _supports_adaptive_thinking(model):
         kwargs.setdefault("output_config", {})["effort"] = effort
 
     thinking_enabled = "thinking" in kwargs
@@ -995,7 +995,7 @@ async def list_models() -> dict[str, Any]:
                     "opus": "Deep reasoning, hard problems",
                 }.get(alias, ""),
                 "extended_thinking": True,
-                "adaptive_thinking": _is_opus_46(model_id),
+                "adaptive_thinking": _supports_adaptive_thinking(model_id),
                 "default_tool_calls": DEFAULT_TOOL_CALLS.get(alias, 1000),
             }
             for alias, model_id in aliases.items()
@@ -1050,7 +1050,7 @@ async def count_tokens(
         }
 
         # Thinking affects token count — match actual request params
-        if _is_opus_46(model_id):
+        if _supports_adaptive_thinking(model_id):
             kwargs["thinking"] = {"type": "adaptive"}
         else:
             kwargs["thinking"] = {
@@ -1118,7 +1118,7 @@ async def create_batch(
             }
 
             if extended_thinking:
-                if _is_opus_46(model_id):
+                if _supports_adaptive_thinking(model_id):
                     params["thinking"] = {"type": "adaptive"}
                 else:
                     params["thinking"] = {
@@ -1127,7 +1127,7 @@ async def create_batch(
                     }
                     params["max_tokens"] = max(max_tokens, thinking_budget + 8000)
 
-            if effort is not None and _is_opus_46(model_id):
+            if effort is not None and _supports_adaptive_thinking(model_id):
                 params.setdefault("output_config", {})["effort"] = effort
 
             requests.append({
@@ -1331,19 +1331,21 @@ async def models_resource() -> dict[str, Any]:
                 "description": "Deep reasoning, hard problems",
                 "default_tool_calls": DEFAULT_TOOL_CALLS["opus"],
                 "extended_thinking": True,
-                "adaptive_thinking": _is_opus_46(aliases["opus"]),
+                "adaptive_thinking": _supports_adaptive_thinking(aliases["opus"]),
             },
             "sonnet": {
                 "id": aliases["sonnet"],
                 "description": "Balanced reasoning, code review",
                 "default_tool_calls": DEFAULT_TOOL_CALLS["sonnet"],
                 "extended_thinking": True,
+                "adaptive_thinking": _supports_adaptive_thinking(aliases["sonnet"]),
             },
             "haiku": {
                 "id": aliases["haiku"],
                 "description": "Fast exploration, quick questions",
                 "default_tool_calls": DEFAULT_TOOL_CALLS["haiku"],
                 "extended_thinking": True,
+                "adaptive_thinking": _supports_adaptive_thinking(aliases["haiku"]),
             },
         },
     }
