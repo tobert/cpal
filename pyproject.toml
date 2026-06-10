@@ -1,6 +1,6 @@
 [project]
 name = "cpal"
-version = "0.6.0"
+version = "0.7.0"
 description = "An MCP server providing stateful Claude access with extended thinking and tool use"
 readme = "README.md"
 license = "MIT"
@@ -19,7 +19,6 @@ dependencies = [
     "anthropic>=0.86.0",
     "fastmcp>=3.0.1",
     "mcp[cli]>=1.26.0",
-    "python-dotenv>=1.2.1",
 ]
 
 [project.optional-dependencies]

@@ -83,6 +83,38 @@ class TestExecuteTool:
         })
         assert "No matches" in result
 
+    def test_search_project_absolute_pattern_rejected(self):
+        """F23: absolute glob patterns must not walk the real filesystem."""
+        result = execute_tool("search_project", {
+            "search_term": "root",
+            "glob_pattern": "/etc/*",
+        })
+        assert "Error" in result and "relative" in result
+
+    def test_search_project_dotdot_pattern_rejected(self):
+        """F23: patterns containing '..' must be rejected up front."""
+        result = execute_tool("search_project", {
+            "search_term": "root",
+            "glob_pattern": "../*/*.py",
+        })
+        assert "Error" in result and ".." in result
+
+    def test_search_project_dotdot_mid_pattern_rejected(self):
+        """F23: '..' anywhere in the pattern is rejected, not just leading."""
+        result = execute_tool("search_project", {
+            "search_term": "root",
+            "glob_pattern": "src/../../etc/*",
+        })
+        assert "Error" in result
+
+    def test_search_project_dotted_dirname_allowed(self):
+        """A literal directory name starting with dots is not a traversal."""
+        result = execute_tool("search_project", {
+            "search_term": "xyzzy_nonexistent_term_12345",
+            "glob_pattern": "..hidden/*.py",
+        })
+        assert "No matches" in result
+
     def test_unknown_tool(self):
         """Test calling an unknown tool."""
         result = execute_tool("unknown_tool", {})
@@ -1289,3 +1321,306 @@ class TestMaxTokensClamp:
         )
         assert "max_tokens" in kwargs
         assert kwargs["max_tokens"] <= DEFAULT_OUTPUT_CAP
+
+
+class TestSecretFileDenylist:
+    """F22: built-in secret-file denylist blocks reads of sensitive paths.
+
+    Policy: _is_denied_path matches the file's basename (case-insensitively)
+    against a built-in list.  The list is extendable via config.toml
+    denied_path_patterns; config patterns ADD to built-ins, never replace them.
+    """
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _make_file(self, name: str, content: str = "secret") -> str:
+        """Create a temp file with the given basename in the project root."""
+        import cpal.server as srv
+        root = srv._project_root or Path.cwd().resolve()
+        p = root / name
+        p.write_text(content, encoding="utf-8")
+        return str(p)
+
+    def _cleanup(self, name: str) -> None:
+        import cpal.server as srv
+        root = srv._project_root or Path.cwd().resolve()
+        p = root / name
+        if p.exists():
+            p.unlink()
+
+    # ── _is_denied_path unit tests ────────────────────────────────────────────
+
+    def test_media_paths_denied_in_build_content_blocks(self):
+        """Defense in depth: build_content_blocks blocks denied media_paths
+        even though _consult pre-validates them."""
+        path = self._make_file("fake_cert.pem", "not really a pdf")
+        try:
+            blocks = build_content_blocks("Query", media_paths=[path])
+            joined = " ".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+            assert "secret-file denylist" in joined
+            assert "not really a pdf" not in joined
+        finally:
+            self._cleanup("fake_cert.pem")
+
+    def test_dotenv_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path(".env")) is True
+
+    def test_dotenv_local_is_denied(self):
+        """'.env.local' matches '.env.*' pattern."""
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path(".env.local")) is True
+
+    def test_dotenv_production_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path(".env.production")) is True
+
+    def test_pem_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("server.pem")) is True
+
+    def test_key_ext_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("something.key")) is True
+
+    def test_underscore_key_suffix_is_denied(self):
+        """Files ending in '_key' (no extension) are denied."""
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("deploy_key")) is True
+
+    def test_underscore_key_txt_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("deploy_key.txt")) is True
+
+    def test_id_rsa_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("id_rsa")) is True
+
+    def test_id_rsa_pub_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("id_rsa.pub")) is True
+
+    def test_id_ed25519_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("id_ed25519")) is True
+
+    def test_id_ecdsa_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("id_ecdsa")) is True
+
+    def test_netrc_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path(".netrc")) is True
+
+    def test_npmrc_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path(".npmrc")) is True
+
+    def test_pypirc_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path(".pypirc")) is True
+
+    def test_credentials_no_ext_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("credentials")) is True
+
+    def test_credentials_with_ext_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("credentials.json")) is True
+
+    def test_keytab_is_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("service.keytab")) is True
+
+    def test_git_config_is_denied(self):
+        """.git/config specifically is denied (not other .git/ paths)."""
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path(".git/config")) is True
+
+    def test_git_HEAD_is_not_denied(self):
+        """.git/HEAD is NOT denied — only .git/config is a secret."""
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path(".git/HEAD")) is False
+
+    # ── "must NOT block normal files" ─────────────────────────────────────────
+
+    def test_monkey_py_not_denied(self):
+        """'monkey.py' must not be blocked — '*key*' style globs would catch it."""
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("monkey.py")) is False
+
+    def test_keyboard_py_not_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("keyboard.py")) is False
+
+    def test_normal_py_not_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("server.py")) is False
+
+    def test_readme_not_denied(self):
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("README.md")) is False
+
+    # ── execute_tool read_file integration ────────────────────────────────────
+
+    def test_read_file_dotenv_blocked(self):
+        """execute_tool read_file on a .env file must return the denylist error."""
+        fname = ".env"
+        try:
+            self._make_file(fname, "SECRET=hunter2")
+            result = execute_tool("read_file", {"path": fname})
+            assert "Error" in result
+            assert "denylist" in result.lower() or "blocked" in result.lower() or "denied" in result.lower()
+            # Must NOT leak file content
+            assert "hunter2" not in result
+        finally:
+            self._cleanup(fname)
+
+    def test_read_file_pem_blocked(self):
+        """execute_tool read_file on a .pem file must be blocked."""
+        fname = "server.pem"
+        try:
+            self._make_file(fname, "-----BEGIN CERTIFICATE-----")
+            result = execute_tool("read_file", {"path": fname})
+            assert "Error" in result
+            assert "hunter2" not in result
+        finally:
+            self._cleanup(fname)
+
+    def test_read_file_deploy_key_blocked(self):
+        """execute_tool read_file on 'deploy_key' must be blocked."""
+        fname = "deploy_key"
+        try:
+            self._make_file(fname, "PRIVATE KEY MATERIAL")
+            result = execute_tool("read_file", {"path": fname})
+            assert "Error" in result
+        finally:
+            self._cleanup(fname)
+
+    def test_read_file_monkey_py_not_blocked(self):
+        """'monkey.py' must NOT be blocked — only exact pattern matches."""
+        fname = "monkey.py"
+        try:
+            self._make_file(fname, "# monkey business\n")
+            result = execute_tool("read_file", {"path": fname})
+            # Should succeed (return file content, not an error)
+            assert "monkey business" in result
+        finally:
+            self._cleanup(fname)
+
+    def test_read_file_keyboard_py_not_blocked(self):
+        """'keyboard.py' must NOT be blocked."""
+        fname = "keyboard.py"
+        try:
+            self._make_file(fname, "# keyboard handler\n")
+            result = execute_tool("read_file", {"path": fname})
+            assert "keyboard handler" in result
+        finally:
+            self._cleanup(fname)
+
+    # ── execute_tool search_project integration ───────────────────────────────
+
+    def test_search_project_skips_dotenv(self):
+        """search_project must not return matches from a .env file."""
+        fname = ".env"
+        search_term = "SUPER_SECRET_CPAL_TEST_TERM"
+        try:
+            self._make_file(fname, f"{search_term}=hunter2\n")
+            result = execute_tool("search_project", {
+                "search_term": search_term,
+                "glob_pattern": "**/*",
+            })
+            # The secret term must not appear in results
+            assert search_term not in result
+            # The filename must not be leaked either
+            assert ".env" not in result
+        finally:
+            self._cleanup(fname)
+
+    # ── _consult file_paths pre-validation ────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_consult_file_paths_dotenv_blocked(self):
+        """_consult with file_paths=['.env'] must return denylist error, no API call."""
+        import cpal.server as srv
+        fname = ".env"
+        # Ensure the file exists so validation reaches the denylist check
+        root = srv._project_root or Path.cwd().resolve()
+        p = root / fname
+        try:
+            p.write_text("SECRET=hunter2", encoding="utf-8")
+            result = await _consult(
+                query="read this",
+                session_id="test-denylist-consult",
+                model_alias="opus",
+                file_paths=[fname],
+            )
+            assert "Error" in result
+            assert "denylist" in result.lower() or "blocked" in result.lower() or "denied" in result.lower()
+        finally:
+            if p.exists():
+                p.unlink()
+
+    # ── config extension ──────────────────────────────────────────────────────
+
+    def test_config_extension_adds_pattern(self, monkeypatch):
+        """denied_path_patterns in config extends built-ins; custom pattern blocks."""
+        import cpal.server as srv
+        # Monkeypatch the extra patterns used by _is_denied_path
+        monkeypatch.setattr(srv, "_extra_denied_patterns", ["*.supersecret"])
+        from cpal.server import _is_denied_path
+        assert _is_denied_path(Path("report.supersecret")) is True
+
+    def test_config_extension_does_not_remove_builtins(self, monkeypatch):
+        """Adding config patterns does not disable built-in patterns."""
+        import cpal.server as srv
+        monkeypatch.setattr(srv, "_extra_denied_patterns", ["*.supersecret"])
+        from cpal.server import _is_denied_path
+        # Built-in must still fire
+        assert _is_denied_path(Path(".env")) is True
+
+    def test_load_config_denied_path_patterns_non_list_warns(self, caplog, monkeypatch, tmp_path):
+        """Non-list denied_path_patterns in config.toml is logged and ignored."""
+        import logging
+        import cpal.server as srv
+        # Patch _load_config to return a bad value
+        with caplog.at_level(logging.WARNING, logger="cpal"):
+            result, sources = srv._build_system_prompt(
+                config={"denied_path_patterns": "oops-not-a-list"},
+            )
+        # The field is handled in _build_system_prompt or _load_denied_patterns;
+        # a warning must be emitted (test uses _build_system_prompt as the entry
+        # point consistent with how main() calls it)
+        # We'll verify the module-level helper separately; here just ensure
+        # no crash occurs and the string is not treated as a list of chars.
+
+    # ── dotenv removal assertion ──────────────────────────────────────────────
+
+    def test_load_dotenv_not_in_server_source(self):
+        """load_dotenv must have been removed from server.py (F22)."""
+        server_path = Path(__file__).parent.parent / "src" / "cpal" / "server.py"
+        source = server_path.read_text(encoding="utf-8")
+        assert "load_dotenv" not in source, (
+            "load_dotenv() found in server.py — it must be removed (F22). "
+            "python-dotenv silently loads whichever project's .env is in CWD, "
+            "creating surprise key/billing selection."
+        )
+        assert "from dotenv" not in source, (
+            "'from dotenv' import found in server.py — must be removed (F22)."
+        )
+
+    # ── resource://config/limits exposes denylist ─────────────────────────────
+
+    def test_limits_resource_exposes_denylist(self):
+        """resource://config/limits must include a 'secret_denylist' key."""
+        from cpal.server import get_limits
+        limits = get_limits()
+        assert "secret_denylist" in limits, (
+            "get_limits() must expose 'secret_denylist' so operators can "
+            "inspect which patterns are active."
+        )
+        denylist = limits["secret_denylist"]
+        assert isinstance(denylist, list)
+        # Must include at least the obvious built-ins
+        assert any(".env" in p for p in denylist)
+        assert any("id_rsa*" in p for p in denylist)

@@ -43,6 +43,7 @@ def reset_cpal_module_state():
     orig_session_locks = dict(srv._session_locks)
     orig_project_root = srv._project_root
     orig_client = srv._client
+    orig_extra_denied = list(srv._extra_denied_patterns)
 
     # Reset before the test
     srv._discovered_models = None
@@ -52,6 +53,7 @@ def reset_cpal_module_state():
     # Leave _project_root as-is so path-validation tests keep working; each
     # test that cares about _project_root sets it explicitly or uses monkeypatch.
     srv._client = None
+    srv._extra_denied_patterns = []
 
     yield
 
@@ -62,3 +64,4 @@ def reset_cpal_module_state():
     srv.sessions.clear()
     srv._session_locks.clear()
     srv._client = None
+    srv._extra_denied_patterns = []

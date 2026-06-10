@@ -22,14 +22,11 @@ from pathlib import Path
 from typing import Any
 
 import anthropic
-from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
 from cpal import __version__
 from cpal.git_tools import GIT_TOOL_SCHEMA, execute_git
-
-load_dotenv()
 
 # Tool annotations for MCP clients
 READONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
@@ -52,7 +49,9 @@ MAX_SEARCH_FILES = 1000
 MAX_SEARCH_MATCHES = 20
 SESSION_TTL = 3600  # 1 hour - sessions expire after this
 MAX_SESSION_MESSAGES = 200  # Prune oldest messages beyond this
-# Default tool call limits (can be overridden per-call)
+# Default tool call limits per tier.  Can be overridden per-call via the
+# max_tool_calls parameter on consult_claude/_consult, or globally via the
+# CPAL_MAX_TOOL_CALLS environment variable (which replaces all tier values).
 DEFAULT_TOOL_CALLS = {
     "haiku": 1000,
     "sonnet": 1000,
@@ -298,6 +297,82 @@ TEXT_EXTENSIONS: set[str] = {
     ".html", ".css", ".xml", ".yaml", ".yml", ".toml", ".ini",
     ".sh", ".bash", ".zsh", ".fish",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secret-file denylist (F22)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Built-in patterns matched against the file's basename (case-insensitively)
+# using fnmatch.  These are NEVER removable via config — config can only add.
+#
+# Design note: patterns are deliberately narrow.  "*key*" would also match
+# "monkey.py" or "keyboard.py".  Use specific suffix/prefix patterns only.
+_BUILTIN_DENIED_PATTERNS: tuple[str, ...] = (
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*_key",
+    "*_key.txt",
+    "id_rsa*",
+    "id_ed25519*",
+    "id_ecdsa*",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "credentials.*",
+    "*.keytab",
+)
+
+# Extra patterns loaded from config.toml denied_path_patterns.
+# Populated in _apply_denied_path_config(); never remove built-ins here.
+_extra_denied_patterns: list[str] = []
+
+
+def _is_denied_path(path: Path) -> bool:
+    """Return True if path is on the secret-file denylist.
+
+    Checks the basename (case-insensitively) against built-in patterns and any
+    config-provided extra patterns.  Also denies .git/config specifically.
+
+    Used by read_file, search_project, build_content_blocks, _consult, and
+    count_tokens to prevent the sandboxed model from reading secrets.
+    """
+    import fnmatch
+
+    # Special case: .git/config — check relative parts
+    parts = path.parts
+    if len(parts) >= 2 and parts[-2] == ".git" and parts[-1] == "config":
+        return True
+
+    basename = path.name.lower()
+    all_patterns = list(_BUILTIN_DENIED_PATTERNS) + _extra_denied_patterns
+    for pattern in all_patterns:
+        if fnmatch.fnmatch(basename, pattern.lower()):
+            return True
+    return False
+
+
+def _apply_denied_path_config(config: dict) -> None:
+    """Load denied_path_patterns from config dict into _extra_denied_patterns.
+
+    Non-list values are logged and ignored (consistent with system_prompts
+    handling).  Called from main() after _load_config().
+    """
+    global _extra_denied_patterns
+    raw = config.get("denied_path_patterns")
+    if raw is None:
+        return
+    if not isinstance(raw, list):
+        logger.warning(
+            "Config 'denied_path_patterns' must be a list, got %s; ignoring.",
+            type(raw).__name__,
+        )
+        return
+    _extra_denied_patterns = [str(p) for p in raw]
+    logger.info("Loaded %d extra denied path patterns from config", len(_extra_denied_patterns))
 
 
 def detect_mime_type(path: str) -> str | None:
@@ -642,6 +717,9 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
         path = input_data.get("path", "")
         try:
             p = _validate_path(path)
+            # F22: check denylist before any file access
+            if _is_denied_path(Path(path)):
+                return f"Error: '{path}' is blocked by the secret-file denylist."
             if not p.exists():
                 return f"Error: File '{path}' does not exist."
             if not p.is_file():
@@ -665,6 +743,14 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
         if not search_term:
             return "Error: search_term cannot be empty."
         glob_pattern = input_data.get("glob_pattern", "**/*")
+        # Reject patterns that would walk outside the sandbox before iglob
+        # runs: absolute patterns ignore root_dir entirely, and '..' segments
+        # traverse out. Per-file validation below would discard the results,
+        # but we shouldn't stat/walk arbitrary directories at all.
+        if os.path.isabs(glob_pattern):
+            return "Error: glob_pattern must be relative to the project root."
+        if ".." in Path(glob_pattern).parts:
+            return "Error: glob_pattern must not contain '..' segments."
         try:
             # Anchor glob to project root (not CWD)
             root = _validate_path(".")
@@ -686,6 +772,9 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
                 except ValueError:
                     continue
                 if not validated_path.is_file():
+                    continue
+                # F22: silently skip denied paths (do not leak existence via match output)
+                if _is_denied_path(Path(filepath)):
                     continue
 
                 try:
@@ -806,6 +895,10 @@ def build_content_blocks(
     # Add text files as text blocks
     for path in file_paths or []:
         try:
+            # F22: denylist check before any file content reaches the API
+            if _is_denied_path(Path(path)):
+                blocks.append({"type": "text", "text": f"Error: '{path}' is blocked by the secret-file denylist."})
+                continue
             p = _validate_path(path)
             content = p.read_text(encoding="utf-8")
             blocks.append({
@@ -818,6 +911,10 @@ def build_content_blocks(
     # Add media files (images, PDFs)
     for path in media_paths or []:
         try:
+            # F22: denylist check before any file content reaches the API
+            if _is_denied_path(Path(path)):
+                blocks.append({"type": "text", "text": f"Error: '{path}' is blocked by the secret-file denylist."})
+                continue
             p = _validate_path(path)
             if p.stat().st_size > MAX_INLINE_MEDIA:
                 blocks.append({
@@ -1064,12 +1161,20 @@ async def run_agentic_loop(
     effort: str | None = None,
     context_1m: bool = False,
     ctx: Context | None = None,
+    commit_fn: Any | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """
     Run Claude with tool use, executing tools until we get a final response.
 
     Reports progress via ctx (MCP Context) when provided.
     Returns (response_text, updated_messages).
+
+    commit_fn: optional callable(messages) called after each completed tool
+    round (assistant tool_use + user tool_results both appended) and at every
+    loop exit path.  _consult passes a closure that grafts the loop's new turns
+    onto the original stored history and writes to session["messages"], enabling
+    incremental session commits so that MCP timeout / CancelledError does not
+    discard all in-flight work.
     """
     # Build request kwargs — base params
     kwargs: dict[str, Any] = {
@@ -1107,91 +1212,197 @@ async def run_agentic_loop(
     MAX_PAUSE_CONTINUATIONS = 10
     pause_continuation_count = 0
 
-    while tool_call_count < max_tool_calls:
-        response = await create_fn(**kwargs)
+    def _commit(msgs: list[dict[str, Any]]) -> None:
+        """Call commit_fn if one was provided."""
+        if commit_fn is not None:
+            commit_fn(msgs)
 
-        # Check if we're done (no tool use)
-        if response.stop_reason == "end_turn":
-            text, thinking = extract_text_and_thinking(response.content)
+    def _synthesize_tool_results_for_dangling(
+        msgs: list[dict[str, Any]], reason: str
+    ) -> None:
+        """
+        Append a synthetic tool_result user message for any dangling tool_use
+        blocks in the last assistant message of msgs.
 
-            # Add final assistant response to history (filter thinking blocks)
-            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
-
-            if ctx:
-                await ctx.report_progress(max_tool_calls, max_tool_calls, "Complete")
-
-            result = f"{thinking}\n\n{text}" if thinking else text
-            # F10: fall back to a marker when no text or thinking was produced
-            # (e.g. response is only redacted_thinking blocks)
-            return result or "[no text content; stop_reason=end_turn]", messages
-
-        # Handle tool use
-        if response.stop_reason == "tool_use":
-            # Add assistant's response to messages (filter thinking blocks)
-            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
-
-            # Process each tool call.
-            # F8: execute_tool is synchronous and may block for up to MAX_FILE_SIZE
-            # bytes of file I/O or GIT_TIMEOUT (30 s) for git subprocesses.  Running
-            # it directly would starve the event loop; wrap in asyncio.to_thread so
-            # other coroutines (MCP pings, other sessions) can make progress.
-            # The threading locks already used by execute_tool make this safe.
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    tool_call_count += 1
-                    result = await asyncio.to_thread(execute_tool, block.name, block.input)
-                    tool_results.append({
+        Used on CancelledError and any other loop exit that finds the last
+        assistant message contains tool_use blocks without matching results.
+        Modifies msgs in place.
+        """
+        if not msgs:
+            return
+        last = msgs[-1]
+        if last.get("role") != "assistant":
+            return
+        content = last.get("content", [])
+        dangling = [
+            getattr(b, "id", b.get("id") if isinstance(b, dict) else None)
+            for b in content
+            if getattr(b, "type", None) == "tool_use"
+            or (isinstance(b, dict) and b.get("type") == "tool_use")
+        ]
+        dangling = [d for d in dangling if d]
+        if dangling:
+            msgs.append({
+                "role": "user",
+                "content": [
+                    {
                         "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
-                    if ctx:
-                        await ctx.report_progress(tool_call_count, max_tool_calls)
-                        await ctx.info(f"Tool call {tool_call_count}: {block.name}")
+                        "tool_use_id": tid,
+                        "content": f"[tool not executed: {reason}]",
+                    }
+                    for tid in dangling
+                ],
+            })
 
-            # Add tool results
-            messages.append({"role": "user", "content": tool_results})
+    try:
+        while tool_call_count < max_tool_calls:
+            try:
+                response = await create_fn(**kwargs)
+            except asyncio.CancelledError:
+                # F32 cancellation safety: the API call itself was cancelled
+                # (no response came back, so nothing was appended yet).
+                # Synthesize tool_results for any dangling tool_use from a
+                # prior iteration, commit, and re-raise.
+                _synthesize_tool_results_for_dangling(messages, "query cancelled")
+                _commit(messages)
+                raise
 
-            # Update kwargs for next iteration
-            kwargs["messages"] = messages
-            continue
+            # Check if we're done (no tool use)
+            if response.stop_reason == "end_turn":
+                text, thinking = extract_text_and_thinking(response.content)
 
-        # F2: pause_turn means the model yielded the event loop but wants to
-        # continue.  Re-send with accumulated messages (per API docs).
-        # Bound continuations to avoid infinite loops.
-        if response.stop_reason == "pause_turn":
-            if pause_continuation_count >= MAX_PAUSE_CONTINUATIONS:
-                # Treat as terminal to avoid hanging forever
+                # Add final assistant response to history (filter thinking blocks)
+                messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
+
+                if ctx:
+                    await ctx.report_progress(max_tool_calls, max_tool_calls, "Complete")
+
+                result = f"{thinking}\n\n{text}" if thinking else text
+                # F10: fall back to a marker when no text or thinking was produced
+                # (e.g. response is only redacted_thinking blocks)
+                final_result = result or "[no text content; stop_reason=end_turn]"
+                _commit(messages)
+                return final_result, messages
+
+            # Handle tool use
+            if response.stop_reason == "tool_use":
+                # Add assistant's response to messages (filter thinking blocks)
+                messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
+
+                # Process each tool call.
+                # F8: execute_tool is synchronous and may block for up to MAX_FILE_SIZE
+                # bytes of file I/O or GIT_TIMEOUT (30 s) for git subprocesses.  Running
+                # it directly would starve the event loop; wrap in asyncio.to_thread so
+                # other coroutines (MCP pings, other sessions) can make progress.
+                # The threading locks already used by execute_tool make this safe.
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        tool_call_count += 1
+                        try:
+                            result = await asyncio.to_thread(execute_tool, block.name, block.input)
+                        except asyncio.CancelledError:
+                            # F32: cancelled mid-tool-execution.  The assistant tool_use
+                            # message was already appended but we have not yet appended
+                            # tool_results.  Build synthetic results for all remaining
+                            # (unexecuted) tool_use blocks so the history is structurally
+                            # valid, then commit and re-raise.
+                            # Mark this block as not-executed.
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": "[tool not executed: query cancelled]",
+                            })
+                            # Also synthesize for any remaining tool_use blocks after this one
+                            for remaining_block in response.content:
+                                if (getattr(remaining_block, "type", None) == "tool_use"
+                                        and getattr(remaining_block, "id", None) != block.id
+                                        and not any(tr["tool_use_id"] == remaining_block.id for tr in tool_results)):
+                                    tool_results.append({
+                                        "type": "tool_result",
+                                        "tool_use_id": remaining_block.id,
+                                        "content": "[tool not executed: query cancelled]",
+                                    })
+                            messages.append({"role": "user", "content": tool_results})
+                            _commit(messages)
+                            raise
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        })
+                        if ctx:
+                            await ctx.report_progress(tool_call_count, max_tool_calls)
+                            await ctx.info(f"Tool call {tool_call_count}: {block.name}")
+
+                # Add tool results — round is now complete (invariant: tool_use + tool_results paired)
+                messages.append({"role": "user", "content": tool_results})
+
+                # F32 incremental commit: progress is preserved after each completed
+                # tool round so that MCP timeouts / CancelledError don't discard it.
+                _commit(messages)
+
+                # Update kwargs for next iteration
+                kwargs["messages"] = messages
+                continue
+
+            # F2: pause_turn means the model yielded the event loop but wants to
+            # continue.  Re-send with accumulated messages (per API docs).
+            # Bound continuations to avoid infinite loops.
+            if response.stop_reason == "pause_turn":
+                if pause_continuation_count >= MAX_PAUSE_CONTINUATIONS:
+                    # Treat as terminal to avoid hanging forever
+                    text, thinking = extract_text_and_thinking(response.content)
+                    messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
+                    result = f"{thinking}\n\n{text}" if thinking else text
+                    final_result = (
+                        result or f"[pause_turn limit reached after {pause_continuation_count} continuations]"
+                    )
+                    _commit(messages)
+                    return final_result, messages
+                pause_continuation_count += 1
+                # Append what we have so the model can see its own partial output,
+                # then re-send.
+                messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
+                kwargs["messages"] = messages
+                continue
+
+            # F2: Handle max_tokens and unknown stop reasons.  The response may
+            # end with tool_use blocks that were never resolved.  Persisting an
+            # assistant message with unresolved tool_use blocks poisons the session
+            # — the next API call will 400 with "tool_use ids found without
+            # tool_result blocks".  Fix: append a synthetic user message with
+            # tool_result blocks containing a placeholder explanation for each
+            # dangling tool_use_id.
+            dangling_tool_ids = [
+                block.id
+                for block in response.content
+                if getattr(block, "type", None) == "tool_use"
+            ]
+
+            # Handle max_tokens - response was truncated
+            if response.stop_reason == "max_tokens":
                 text, thinking = extract_text_and_thinking(response.content)
                 messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
+                if dangling_tool_ids:
+                    # Synthesize tool_result entries so the session stays valid
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tid,
+                                "content": "[tool not executed: response truncated at max_tokens]",
+                            }
+                            for tid in dangling_tool_ids
+                        ],
+                    })
                 result = f"{thinking}\n\n{text}" if thinking else text
-                return (
-                    result or f"[pause_turn limit reached after {pause_continuation_count} continuations]",
-                    messages,
-                )
-            pause_continuation_count += 1
-            # Append what we have so the model can see its own partial output,
-            # then re-send.
-            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
-            kwargs["messages"] = messages
-            continue
+                final_result = f"{result}\n\n[Response truncated - max tokens reached]"
+                _commit(messages)
+                return final_result, messages
 
-        # F2: Handle max_tokens and unknown stop reasons.  The response may
-        # end with tool_use blocks that were never resolved.  Persisting an
-        # assistant message with unresolved tool_use blocks poisons the session
-        # — the next API call will 400 with "tool_use ids found without
-        # tool_result blocks".  Fix: append a synthetic user message with
-        # tool_result blocks containing a placeholder explanation for each
-        # dangling tool_use_id.
-        dangling_tool_ids = [
-            block.id
-            for block in response.content
-            if getattr(block, "type", None) == "tool_use"
-        ]
-
-        # Handle max_tokens - response was truncated
-        if response.stop_reason == "max_tokens":
+            # Unknown stop reason - extract what we have
             text, thinking = extract_text_and_thinking(response.content)
             messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
             if dangling_tool_ids:
@@ -1202,37 +1413,33 @@ async def run_agentic_loop(
                         {
                             "type": "tool_result",
                             "tool_use_id": tid,
-                            "content": "[tool not executed: response truncated at max_tokens]",
+                            "content": f"[tool not executed: response stopped ({response.stop_reason})]",
                         }
                         for tid in dangling_tool_ids
                     ],
                 })
             result = f"{thinking}\n\n{text}" if thinking else text
-            return f"{result}\n\n[Response truncated - max tokens reached]", messages
+            final_result = result or f"Stopped: {response.stop_reason}"
+            _commit(messages)
+            return final_result, messages
 
-        # Unknown stop reason - extract what we have
-        text, thinking = extract_text_and_thinking(response.content)
-        messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
-        if dangling_tool_ids:
-            # Synthesize tool_result entries so the session stays valid
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tid,
-                        "content": f"[tool not executed: response stopped ({response.stop_reason})]",
-                    }
-                    for tid in dangling_tool_ids
-                ],
-            })
-        result = f"{thinking}\n\n{text}" if thinking else text
-        return result or f"Stopped: {response.stop_reason}", messages
+        # Max tool calls exceeded
+        error_msg = (
+            f"Reached maximum tool calls ({max_tool_calls}). "
+            f"Pass max_tool_calls=N to increase the limit, or continue in a new query."
+        )
+        messages.append({"role": "assistant", "content": error_msg})
+        _commit(messages)
+        return error_msg, messages
 
-    # Max tool calls exceeded
-    error_msg = f"Reached maximum tool calls ({max_tool_calls}). Please continue in a new query."
-    messages.append({"role": "assistant", "content": error_msg})
-    return error_msg, messages
+    except asyncio.CancelledError:
+        # F32 cancellation safety: outer catch for any CancelledError not already
+        # handled by the inner try/except blocks (e.g. during the while-condition
+        # check or other async points).  Ensure dangling tool_use is resolved and
+        # commit whatever progress we have, then re-raise.
+        _synthesize_tool_results_for_dangling(messages, "query cancelled")
+        _commit(messages)
+        raise
 
 
 async def _consult(
@@ -1246,8 +1453,14 @@ async def _consult(
     effort: str | None = None,
     context_1m: bool = False,
     ctx: Context | None = None,
+    max_tool_calls: int | None = None,
 ) -> str:
-    """Send a query to Claude with optional file/media context."""
+    """Send a query to Claude with optional file/media context.
+
+    max_tool_calls: cap the tool call count for this specific call.
+        None (default) → use the tier default from DEFAULT_TOOL_CALLS.
+        1–10000 → override for this call only.
+    """
     # Input validation
     if not query or not query.strip():
         return "Error: Query cannot be empty."
@@ -1255,9 +1468,20 @@ async def _consult(
     if thinking_budget < MIN_THINKING_BUDGET or thinking_budget > 100000:
         return f"Error: thinking_budget must be between {MIN_THINKING_BUDGET} and 100000."
 
+    # F32/F37: validate per-call max_tool_calls if provided
+    if max_tool_calls is not None:
+        if not isinstance(max_tool_calls, int) or max_tool_calls < 1 or max_tool_calls > 10000:
+            return (
+                f"Error: max_tool_calls must be an integer between 1 and 10000, "
+                f"got {max_tool_calls!r}."
+            )
+
     # Validate file paths before touching the API
     if file_paths:
         for path in file_paths:
+            # F22: denylist check before any API spend
+            if _is_denied_path(Path(path)):
+                return f"Error: '{path}' is blocked by the secret-file denylist."
             try:
                 validated = _validate_path(path)
                 if validated.stat().st_size > MAX_FILE_SIZE:
@@ -1268,6 +1492,9 @@ async def _consult(
                 return f"Error accessing '{path}': {e}"
     if media_paths:
         for path in media_paths:
+            # F22: denylist check before any API spend
+            if _is_denied_path(Path(path)):
+                return f"Error: '{path}' is blocked by the secret-file denylist."
             try:
                 validated = _validate_path(path)
                 if validated.stat().st_size > MAX_INLINE_MEDIA:
@@ -1304,15 +1531,22 @@ async def _consult(
         session = await get_session(session_id, model_alias)
         model = session["model"]
 
-        max_tool_calls = DEFAULT_TOOL_CALLS.get(model_alias.lower(), 1000)
+        # Resolve effective tool call limit: per-call override or tier default.
+        effective_max_tool_calls: int = (
+            max_tool_calls
+            if max_tool_calls is not None
+            else DEFAULT_TOOL_CALLS.get(model_alias.lower(), 1000)
+        )
 
         # Build the user message content
         content = build_content_blocks(query, file_paths, media_paths)
 
-        # Snapshot how many messages are currently stored so we can identify
-        # the new turns appended by the loop (used below to preserve thinking
-        # blocks in stored history when extended_thinking is False).
-        stored_count = len(session["messages"])
+        # Snapshot the original stored history so the commit closure can always
+        # graft new turns onto the original (not a previously-filtered copy).
+        # This is the same value as "session["messages"] at this point", captured
+        # before the loop appends anything.
+        original_stored = list(session["messages"])
+        stored_count = len(original_stored)
 
         # Build message history for the request.
         # _build_messages_for_request returns a copy; when extended_thinking is
@@ -1325,6 +1559,29 @@ async def _consult(
         )
         current_messages.append({"role": "user", "content": content})
 
+        # F32 incremental session commit closure.
+        #
+        # Called by run_agentic_loop after each completed tool round and at each
+        # exit path (including on CancelledError).  The session lock is held for
+        # the entire call, so these writes are race-free.
+        #
+        # Grafting invariant: always compute merged history as
+        #   original_stored + [user_msg] + new_turns
+        # where new_turns = loop_messages[stored_count + 1:]
+        # This preserves thinking blocks in prior assistant messages (they live in
+        # original_stored) even when extended_thinking=False stripped them from the
+        # API-request copy (current_messages).  Idempotent: repeated calls with the
+        # same loop_messages produce the same result because we always recompute
+        # from (original_stored, loop_messages) — no duplication.
+        def commit_to_session(loop_messages: list[dict[str, Any]]) -> None:
+            # new_turns are all messages the loop appended after the user query
+            # (index stored_count+1 onward in the loop's message list).
+            new_turns = loop_messages[stored_count + 1:]
+            merged = original_stored + [{"role": "user", "content": content}] + new_turns
+            merged = _prune_messages(merged, MAX_SESSION_MESSAGES)
+            session["messages"] = merged
+            session["last_access"] = time.time()
+
         try:
             response_text, updated_messages = await run_agentic_loop(
                 client,
@@ -1332,41 +1589,26 @@ async def _consult(
                 current_messages,
                 extended_thinking=extended_thinking,
                 thinking_budget=thinking_budget,
-                max_tool_calls=max_tool_calls,
+                max_tool_calls=effective_max_tool_calls,
                 effort=effort,
                 context_1m=context_1m,
                 ctx=ctx,
+                commit_fn=commit_to_session,
             )
-            # Compute how many new turns the loop appended.  The loop mutates
-            # current_messages in place, so updated_messages IS current_messages.
-            # We started with stored_count stored messages + 1 user message we
-            # appended above, so new turns start at index (stored_count + 1).
-            new_turns = updated_messages[stored_count + 1:]
-
-            # Reconstruct the stored messages by appending only the new turns
-            # onto the ORIGINAL stored history.  This preserves any thinking
-            # blocks in prior assistant messages even after a non-thinking turn.
-            merged_messages = list(session["messages"])
-            merged_messages.append({"role": "user", "content": content})
-            merged_messages.extend(new_turns)
-
-            # Prune to prevent unbounded growth.  Use turn-boundary pruning
-            # (_prune_messages) instead of naive tail-slicing so the retained
-            # head is always a plain user message.  Naive slicing can produce
-            # a head that starts with an assistant message or with a user
-            # tool_result message whose tool_use was just discarded — both
-            # cause the API to 400 on the next request in that session.
-            merged_messages = _prune_messages(merged_messages, MAX_SESSION_MESSAGES)
-            session["messages"] = merged_messages
-
-            # F6: refresh last_access after the loop completes, not just at call
-            # start. A long agentic run (1000 tool calls × multi-second round trips)
-            # can exceed SESSION_TTL from the start-of-call timestamp alone; updating
-            # here ensures the TTL reflects when the session was *last active*.
-            session["last_access"] = time.time()
-
+            # Final commit: commit_to_session is idempotent (always recomputes from
+            # original_stored + loop_messages), so calling it here is safe even if
+            # run_agentic_loop already called it at its exit path.  This also handles
+            # the case where run_agentic_loop is replaced by a mock that doesn't call
+            # commit_fn (e.g. in tests).
+            commit_to_session(updated_messages)
             return response_text
 
+        except asyncio.CancelledError:
+            # F32: CancelledError is expected on MCP timeout / client cancel.
+            # run_agentic_loop already called commit_to_session with synthetic
+            # tool_results before re-raising, so partial history is already saved.
+            # Re-raise so the MCP framework can report the cancellation to the client.
+            raise
         except anthropic.APIError as e:
             # API errors are expected failure modes (bad key, rate-limit, etc.)
             # — surface as a readable string so the MCP client can report them.
@@ -1401,6 +1643,7 @@ async def consult_claude(
     effort: str | None = None,
     context_1m: bool = False,
     ctx: Context | None = None,
+    max_tool_calls: int | None = None,
 ) -> str:
     """
     Consult Claude for logical precision, planning, and focused analysis.
@@ -1436,11 +1679,17 @@ async def consult_claude(
             otherwise equal or exceed the cap.
         effort: Output effort level: "low", "medium", "high", or "max".
         context_1m: Enable 1M token context window (beta, tier 4+, premium pricing above 200K).
+        max_tool_calls: Override the default tool call cap for this call (1–10000).
+            None (default) uses the tier default (1000 for all tiers, overridable
+            globally via CPAL_MAX_TOOL_CALLS env var).  Use a smaller value (e.g.
+            max_tool_calls=50) for quick scans or when the 600s timeout is a concern.
+            Example: consult_claude(query="...", max_tool_calls=50)
     """
     logger.debug(f"consult_claude: session={session_id}, model={model}")
     return await _consult(
         query, session_id, model, file_paths, media_paths,
-        extended_thinking, thinking_budget, effort, context_1m, ctx
+        extended_thinking, thinking_budget, effort, context_1m, ctx,
+        max_tool_calls=max_tool_calls,
     )
 
 
@@ -1499,6 +1748,9 @@ async def count_tokens(
         # Validate file sizes before building content
         if file_paths:
             for path in file_paths:
+                # F22: denylist check before any API spend
+                if _is_denied_path(Path(path)):
+                    return {"error": f"'{path}' is blocked by the secret-file denylist."}
                 try:
                     validated = _validate_path(path)
                     if validated.stat().st_size > MAX_FILE_SIZE:
@@ -1848,6 +2100,9 @@ def get_limits() -> dict[str, Any]:
             "per-model output cap (128K for Fable 5/Opus 4.6+, 64K otherwise); "
             "budget is reduced if it would otherwise equal or exceed the cap."
         ),
+        # F22: expose active denylist so operators can inspect what's blocked.
+        # Built-ins are always present; config additions appear after them.
+        "secret_denylist": list(_BUILTIN_DENIED_PATTERNS) + _extra_denied_patterns,
     }
 
 
@@ -1973,6 +2228,15 @@ def main() -> None:
             sys.exit(1)
         _api_key = args.key_file.read_text().strip()
 
+    # Log which API key source won (F22: no silent key adoption from .env files).
+    # Never log the key value itself.
+    if args.key_file:
+        logger.info("API key source: --key-file %s", args.key_file)
+    elif os.getenv("ANTHROPIC_API_KEY"):
+        logger.info("API key source: ANTHROPIC_API_KEY environment variable")
+    else:
+        logger.warning("API key source: none found (will error on first use)")
+
     # Load config and compose system prompt.
     # F27: fail_fast_cli=True so that explicitly-passed --system-prompt files
     # that cannot be read cause a clean startup failure rather than silently
@@ -1985,6 +2249,9 @@ def main() -> None:
         fail_fast_cli=True,
     )
     logger.info("System prompt sources: %s", _system_prompt_sources)
+
+    # F22: load any extra denied path patterns from config
+    _apply_denied_path_config(config)
 
     # Capture project root at startup before CWD can change
     _project_root = Path.cwd().resolve()

@@ -141,6 +141,8 @@ consult_claude(
 - **Symlink attack prevention**: Symlinks pointing outside project are blocked
 - **Thread safety**: Per-session locks prevent concurrent access corruption
 - **Session TTL**: Sessions are eligible for cleanup after 1 hour of inactivity; cleanup runs when the active session count exceeds 100
+- **Secret-file denylist**: Built-in patterns block reads of `.env*`, `*.pem`, `*.key`, `*_key`, `id_rsa*`, `.git/config`, etc. at all read surfaces (read_file, search_project, build_content_blocks, _consult, count_tokens). Config can ADD patterns via `denied_path_patterns` in config.toml — built-ins are never removable. Active patterns visible in `resource://config/limits` → `secret_denylist`.
+- **No .env auto-loading**: `load_dotenv()` has been removed. The API key must come from `--key-file` or `ANTHROPIC_API_KEY`; the source is logged at startup (never the key value).
 
 ### Safety Limits
 
@@ -154,8 +156,13 @@ consult_claude(
 
 ### Tool Call Limits
 
-All tiers default to 1000 tool calls. Override globally with the `CPAL_MAX_TOOL_CALLS`
-environment variable (e.g. `CPAL_MAX_TOOL_CALLS=50`).
+All tiers default to 1000 tool calls per query. Two override mechanisms:
+
+- **Per-call**: pass `max_tool_calls=N` to `consult_claude` (1–10000). Useful for quick scans or when the 600s MCP timeout is a concern.
+  ```python
+  consult_claude(query="Quick check", max_tool_calls=50)
+  ```
+- **Global**: set `CPAL_MAX_TOOL_CALLS=50` in the environment to replace the default for all tiers (e.g. `CPAL_MAX_TOOL_CALLS=50`). Invalid or zero values cause a startup error.
 
 ## Installing
 
@@ -222,6 +229,14 @@ system_prompt = "常に日本語で回答してください (Always respond in J
 # If true (default), prepend the built-in cpal system prompt.
 # Set to false to fully replace it with your own.
 include_default_prompt = true
+
+# Extra secret-file denylist patterns (fnmatch on basename, case-insensitive).
+# These ADD to the built-ins (.env*, *.pem, *.key, *_key, id_rsa*, etc.).
+# Built-in patterns are never removed by this setting.
+denied_path_patterns = [
+    "*.vault",
+    "secret_*",
+]
 ```
 
 Paths support `~` and `$ENV_VAR` expansion.

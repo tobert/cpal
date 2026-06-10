@@ -261,13 +261,12 @@ wheels = [
 
 [[package]]
 name = "cpal"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "fastmcp" },
     { name = "mcp", extra = ["cli"] },
-    { name = "python-dotenv" },
 ]
 
 [package.optional-dependencies]
@@ -283,7 +282,6 @@ requires-dist = [
     { name = "mcp", extras = ["cli"], specifier = ">=1.26.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.2" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
-    { name = "python-dotenv", specifier = ">=1.2.1" },
 ]
 provides-extras = ["dev"]
 

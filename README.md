@@ -131,6 +131,9 @@ consult_claude(query="Exhaustive analysis", effort="max")
 
 # 1M context window (beta, tier 4+, premium pricing above 200K tokens)
 consult_claude(query="Analyze this large codebase", context_1m=True)
+
+# Per-call tool call cap (override the default 1000)
+consult_claude(query="Quick scan", max_tool_calls=50)
 ```
 
 ### Utility Tools
@@ -209,6 +212,7 @@ Check what's active via `resource://server/info` — it shows which sources cont
 - Path traversal and symlink attacks are blocked
 - Sessions are isolated per `session_id`
 - File size limits: 10MB text, 20MB media
+- **Secret-file denylist**: Built-in patterns block reads of common secret files (`.env*`, `*.pem`, `*.key`, `*_key`, `id_rsa*`, `.git/config`, etc.) across all read surfaces. Extend the list via `denied_path_patterns` in `~/.config/cpal/config.toml` — config patterns add to built-ins, they never replace them. The `.env` file is never auto-loaded for the API key; use `--key-file` or `ANTHROPIC_API_KEY`.
 - Note: the read-only git tool can still reveal whole-repository commit history (e.g. `git log` or `git show` without a path argument), even when cpal is started in a subdirectory of a larger repository, because git operates on the full repository from any subdirectory.
 
 ## Batch API
@@ -261,7 +265,7 @@ Model aliases are resolved automatically to the latest version per tier via the 
 | `sonnet` | `claude-sonnet-4-6` | Balanced reasoning, code review |
 | `haiku` | `claude-haiku-4-5` | Fast exploration, quick questions |
 
-Claude can make up to 1000 autonomous tool calls per query by default. Override with the `CPAL_MAX_TOOL_CALLS` environment variable.
+Claude can make up to 1000 autonomous tool calls per query by default. Override globally with the `CPAL_MAX_TOOL_CALLS` environment variable, or per-call with `max_tool_calls=N` on `consult_claude`.
 
 ## Notes
 
