@@ -81,8 +81,8 @@ cpal/
 One tool with a `model` parameter (not separate tools per model):
 
 ```python
-consult_claude(query="...", model="opus")    # default
-consult_claude(query="...", model="opus")    # deep reasoning
+consult_claude(query="...", model="opus")    # default, deep reasoning
+consult_claude(query="...", model="fable")   # most capable, premium cost
 consult_claude(query="...", model="haiku")   # fast & cheap
 ```
 
@@ -109,15 +109,22 @@ so the next call retries discovery.
 | `haiku` | Fast exploration, quick questions |
 | `sonnet` | Balanced reasoning, code review |
 | `opus` | Deep analysis, hard problems (default) |
+| `fable` | Most capable — frontier intelligence, premium cost ($10/$50 per MTok) |
 
 Hardcoded fallback IDs are in `FALLBACK_ALIASES` in `server.py` and should
 point to recent model versions. They're only used when API discovery fails.
 
 ### Extended Thinking
 
-All tiers support extended thinking. Opus 4.6 and Sonnet 4.6 use **adaptive
-thinking** (model decides when/how much to think). Older models use manual
-thinking with an explicit `thinking_budget`:
+All tiers support extended thinking. Fable 5, Opus 4.6+, and Sonnet 4.6 use
+**adaptive thinking** (model decides when/how much to think). Older models use
+manual thinking with an explicit `thinking_budget`.
+
+⚠️ On Fable 5 and Opus 4.7+ manual thinking (`budget_tokens`) is **removed**
+and returns a 400 — `_supports_adaptive_thinking()` must classify these
+correctly or every request fails. Those models also omit thinking text by
+default; `_adaptive_thinking_config()` requests `display: "summarized"` so
+callers still see reasoning.
 
 ```python
 consult_claude(
@@ -133,7 +140,7 @@ consult_claude(
 - **Path traversal protection**: All file operations validated against project root
 - **Symlink attack prevention**: Symlinks pointing outside project are blocked
 - **Thread safety**: Per-session locks prevent concurrent access corruption
-- **Session TTL**: Auto-cleanup after 1 hour of inactivity
+- **Session TTL**: Sessions are eligible for cleanup after 1 hour of inactivity; cleanup runs when the active session count exceeds 100
 
 ### Safety Limits
 
@@ -143,7 +150,7 @@ consult_claude(
 | `MAX_INLINE_MEDIA` | 20 MB | Caps inline media size |
 | `MAX_SEARCH_FILES` | 1000 | Caps glob expansion |
 | `MAX_SEARCH_MATCHES` | 20 | Truncates search results |
-| `SESSION_TTL` | 1 hour | Auto-cleanup inactive sessions |
+| `SESSION_TTL` | 1 hour | TTL for inactive sessions (cleanup triggers when session count > 100) |
 
 ### Tool Call Limits
 
@@ -231,7 +238,7 @@ All joined with `\n\n`. Provenance visible in `resource://server/info`.
 
 | Feature | gpal (Gemini) | cpal (Claude) |
 |---------|---------------|---------------|
-| Context window | 2M tokens | 200K tokens |
+| Context window | 2M tokens | 200K tokens (1M via beta, opt-in) |
 | Tool calling | Automatic (SDK) | Manual loop |
 | Extended thinking | N/A | Supported |
 | File upload API | Yes (48h) | No (inline only) |

@@ -42,8 +42,14 @@ def _validate_ref(ref: str) -> str | None:
     return None
 
 
-def _validate_path(path: str, root: Path) -> str | None:
-    """Validate a file path is within the git root. Returns error message or None."""
+def _validate_git_path(path: str, root: Path) -> str | None:
+    """Validate a file path is within the given root directory.
+
+    Returns an error message string, or None if the path is valid.
+
+    Note: renamed from _validate_path (F35) to avoid confusion with
+    server._validate_path (which raises ValueError instead of returning str|None).
+    """
     if not path:
         return "Error: path must not be empty."
     if path.startswith("-"):
@@ -119,6 +125,7 @@ def git(
     ref2: str | None = None,
     path: str | None = None,
     max_count: int = 20,
+    project_root: Path | None = None,
 ) -> str:
     """Read-only git operations for codebase exploration.
 
@@ -128,15 +135,43 @@ def git(
         ref2: Second ref for diff ranges (e.g. diff ref ref2).
         path: Limit to a specific file path.
         max_count: Max commits for log (capped at 100). Default 20.
+        project_root: The cpal server's advertised project root (server._project_root).
+            Used to pin the git subprocess CWD and to enforce the sandbox boundary
+            (F21: git toplevel may be an ancestor of the advertised root).
+            Defaults to process CWD when None (backwards-compat for direct callers).
     """
     # Layer 1: Subcommand whitelist
     if subcommand not in _VALID_SUBCOMMANDS:
         return f"Error: invalid subcommand {subcommand!r}. Must be one of: {', '.join(sorted(_VALID_SUBCOMMANDS))}"
 
-    # Get git root
-    root = _get_git_root()
-    if isinstance(root, str):
-        return root  # error message
+    # Resolve the project root — pin subprocess CWD to it (F21: avoids process CWD drift)
+    cwd = project_root.resolve() if project_root is not None else None
+
+    # Get git root — run from project_root so rev-parse is correct for this directory
+    git_root = _get_git_root(cwd=cwd)
+    if isinstance(git_root, str):
+        return git_root  # error message
+
+    # F21: Intersect the git toplevel with the project root.
+    # When cpal starts in a subdirectory of a larger repo, git_root is the ancestor
+    # (e.g. repo/) while the advertised sandbox is the subdir (e.g. repo/subdir/).
+    # All path validation must use the tighter of the two roots.
+    if project_root is not None:
+        effective_root = project_root.resolve()
+        # Verify the project root is actually inside the git repo (not completely foreign)
+        try:
+            effective_root.relative_to(git_root)
+        except ValueError:
+            return (
+                f"Error: project root {effective_root} is not inside the git repository "
+                f"at {git_root}."
+            )
+    else:
+        effective_root = git_root
+
+    # Subprocess runs inside the effective (project) root, not the git toplevel.
+    # This keeps diff/log output confined to the subdir while git still works correctly.
+    run_cwd = effective_root
 
     # Default ref for subcommands that need one
     if ref is None and subcommand in ("log", "show"):
@@ -153,15 +188,15 @@ def git(
         if err:
             return err
 
-    # Layer 3: Validate path
+    # Layer 3: Validate path — checked against the effective (project) root, not git toplevel
     if path is not None:
-        err = _validate_path(path, root)
+        err = _validate_git_path(path, effective_root)
         if err:
             return err
 
     # Dispatch
     if subcommand == "status":
-        return _run_git(["git", "status", "--porcelain=v2", "--branch"], root)
+        return _run_git(["git", "status", "--porcelain=v2", "--branch"], run_cwd)
 
     elif subcommand == "diff":
         args = ["git", "diff"]
@@ -171,20 +206,20 @@ def git(
             args.append(ref2)
         if path is not None:
             args.extend(["--", path])
-        return _run_git(args, root)
+        return _run_git(args, run_cwd)
 
     elif subcommand == "log":
         count = min(max(1, max_count), MAX_LOG_COUNT)
         args = ["git", "log", f"--max-count={count}", f"--format={_LOG_FORMAT}", ref]
         if path is not None:
             args.extend(["--", path])
-        return _run_git(args, root)
+        return _run_git(args, run_cwd)
 
     elif subcommand == "show":
         args = ["git", "show", f"--format={_SHOW_FORMAT}", ref]
         if path is not None:
             args.extend(["--", path])
-        return _run_git(args, root)
+        return _run_git(args, run_cwd)
 
     # Unreachable due to whitelist check, but just in case
     return f"Error: unhandled subcommand {subcommand!r}"
@@ -231,12 +266,28 @@ GIT_TOOL_SCHEMA = {
 }
 
 
-def execute_git(input_data: dict) -> str:
-    """Dispatch handler for cpal's execute_tool."""
+def execute_git(input_data: dict, project_root: Path | None = None) -> str:
+    """Dispatch handler for cpal's execute_tool.
+
+    Args:
+        input_data: Tool input from the model (subcommand, ref, path, max_count, ...).
+        project_root: The server's advertised project root (server._project_root).
+            Threaded in from server.py's execute_tool to enforce the F21 sandbox fix:
+            validate paths within BOTH the git toplevel AND the project root.
+            Defaults to None for backwards compatibility with direct callers and gpal.
+
+    F26: coerce max_count to int defensively — Claude may send it as a string
+    (JSON numbers are sometimes transmitted as strings by the model or SDK).
+    ValueError/TypeError from the coercion will propagate to execute_tool's
+    try/except wrapper and be returned as an "Error: ..." string.
+    """
+    raw_max_count = input_data.get("max_count", 20)
+    max_count = int(raw_max_count)
     return git(
         subcommand=input_data.get("subcommand", ""),
         ref=input_data.get("ref"),
         ref2=input_data.get("ref2"),
         path=input_data.get("path"),
-        max_count=input_data.get("max_count", 20),
+        max_count=max_count,
+        project_root=project_root,
     )

@@ -15,11 +15,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from cpal.server import (
     execute_tool,
     build_content_blocks,
+    build_thinking_kwargs,
     detect_mime_type,
     is_text_file,
     _validate_path,
     _filter_thinking_blocks,
     _supports_adaptive_thinking,
+    _get_output_cap,
     _consult,
     sessions,
     _session_locks,
@@ -28,6 +30,8 @@ from cpal.server import (
     SESSION_TTL,
     MAX_SESSION_MESSAGES,
     FALLBACK_ALIASES,
+    MODEL_OUTPUT_CAPS,
+    DEFAULT_OUTPUT_CAP,
 )
 
 
@@ -305,6 +309,7 @@ class TestModelDiscovery:
         assert "opus" in result
         assert "sonnet" in result
         assert "haiku" in result
+        assert "fable" in result
 
     @pytest.mark.asyncio
     async def test_fallback_not_cached(self, monkeypatch):
@@ -330,16 +335,22 @@ class TestModelDiscovery:
     def test_fallback_aliases_are_valid(self):
         """Fallback aliases follow expected naming pattern."""
         for tier, model_id in FALLBACK_ALIASES.items():
-            assert tier in ("haiku", "sonnet", "opus")
+            assert tier in ("haiku", "sonnet", "opus", "fable")
             assert model_id.startswith(f"claude-{tier}")
 
 
 class TestCleanupPreservesHeldLocks:
-    """Tests that session cleanup preserves locks held by other coroutines."""
+    """Tests that session cleanup preserves sessions and locks held by active coroutines.
+
+    F6 fix: cleanup must not delete the *session* when its lock is held — doing so
+    silently discards the in-progress agentic loop's history writes.  Both the session
+    and the lock survive; they become eligible for cleanup on the next sweep once
+    the lock is released.
+    """
 
     @pytest.mark.asyncio
     async def test_cleanup_preserves_held_locks(self):
-        """Lock objects should survive cleanup if currently held."""
+        """Both the session and its lock must survive cleanup when the lock is held."""
         import time as time_module
 
         test_sid = "_test_lock_survival_"
@@ -354,9 +365,14 @@ class TestCleanupPreservesHeldLocks:
 
         try:
             cleanup_old_sessions()
-            # Session should be gone
-            assert test_sid not in sessions
-            # But the lock should survive because it's held
+            # F6: the session must NOT be deleted while its lock is held —
+            # an active _consult is inside the agentic loop and will write back
+            # to session["messages"] when it finishes.
+            assert test_sid in sessions, (
+                "cleanup_old_sessions deleted a session whose lock was held — "
+                "this silently discards an in-progress agentic loop's work (F6)"
+            )
+            # The lock must also survive (it is still held)
             assert test_sid in _session_locks
             lock_after = get_session_lock(test_sid)
             assert lock_before is lock_after
@@ -474,6 +490,60 @@ class TestSupportsAdaptiveThinking:
     def test_haiku(self):
         assert _supports_adaptive_thinking("claude-haiku-4-5-20251001") is False
 
+    def test_opus_47(self):
+        assert _supports_adaptive_thinking("claude-opus-4-7") is True
+
+    def test_opus_48(self):
+        assert _supports_adaptive_thinking("claude-opus-4-8") is True
+
+    def test_fable_5(self):
+        assert _supports_adaptive_thinking("claude-fable-5") is True
+
+    def test_fable_5_with_date(self):
+        assert _supports_adaptive_thinking("claude-fable-5-20260301") is True
+
+    def test_opus_4_dated_is_not_adaptive(self):
+        # Date suffix must not parse as a minor version (this is Opus 4.0)
+        assert _supports_adaptive_thinking("claude-opus-4-20250514") is False
+
+    def test_legacy_naming_is_not_adaptive(self):
+        assert _supports_adaptive_thinking("claude-3-5-sonnet-20241022") is False
+
+
+class TestAdaptiveThinkingConfig:
+    """Tests for _adaptive_thinking_config display handling.
+
+    Fable 5 and Opus 4.7+ omit thinking text by default — cpal surfaces
+    thinking, so those models must request display: summarized.
+    """
+
+    def test_fable_requests_summarized(self):
+        from cpal.server import _adaptive_thinking_config
+        assert _adaptive_thinking_config("claude-fable-5") == {
+            "type": "adaptive", "display": "summarized",
+        }
+
+    def test_opus_48_requests_summarized(self):
+        from cpal.server import _adaptive_thinking_config
+        assert _adaptive_thinking_config("claude-opus-4-8") == {
+            "type": "adaptive", "display": "summarized",
+        }
+
+    def test_opus_47_requests_summarized(self):
+        from cpal.server import _adaptive_thinking_config
+        assert _adaptive_thinking_config("claude-opus-4-7") == {
+            "type": "adaptive", "display": "summarized",
+        }
+
+    def test_opus_46_plain_adaptive(self):
+        # display param is a 4.7+ feature; 4.6 already returns summarized text
+        from cpal.server import _adaptive_thinking_config
+        assert _adaptive_thinking_config("claude-opus-4-6") == {"type": "adaptive"}
+
+    def test_sonnet_46_plain_adaptive(self):
+        from cpal.server import _adaptive_thinking_config
+        assert _adaptive_thinking_config("claude-sonnet-4-6") == {"type": "adaptive"}
+
 
 class TestThinkingDefaults:
     """Tests that thinking is on by default."""
@@ -513,17 +583,23 @@ class TestThinkingDefaults:
 class TestFallbackAliases:
     """Test that fallback aliases point to expected models."""
 
-    def test_opus_fallback_is_46(self):
-        assert FALLBACK_ALIASES["opus"] == "claude-opus-4-6"
+    def test_opus_fallback_is_48(self):
+        assert FALLBACK_ALIASES["opus"] == "claude-opus-4-8"
 
     def test_sonnet_fallback_is_46(self):
         assert FALLBACK_ALIASES["sonnet"] == "claude-sonnet-4-6"
+
+    def test_fable_fallback_is_5(self):
+        assert FALLBACK_ALIASES["fable"] == "claude-fable-5"
 
     def test_opus_supports_adaptive(self):
         assert _supports_adaptive_thinking(FALLBACK_ALIASES["opus"]) is True
 
     def test_sonnet_supports_adaptive(self):
         assert _supports_adaptive_thinking(FALLBACK_ALIASES["sonnet"]) is True
+
+    def test_fable_supports_adaptive(self):
+        assert _supports_adaptive_thinking(FALLBACK_ALIASES["fable"]) is True
 
     def test_haiku_no_adaptive(self):
         assert _supports_adaptive_thinking(FALLBACK_ALIASES["haiku"]) is False
@@ -648,3 +724,568 @@ class TestSessionLockCleanup:
         finally:
             sessions.pop(test_sid, None)
             _session_locks.pop(test_sid, None)
+
+
+class TestThinkingBudgetFloor:
+    """F13: API minimum thinking budget is 1024, not 1000.
+
+    Tests that budgets in the range [1000, 1023] are rejected everywhere they
+    are validated, since they would be accepted locally but rejected by the API
+    with a confusing error message.
+    """
+
+    @pytest.mark.asyncio
+    async def test_consult_rejects_budget_1023(self):
+        """_consult should reject thinking_budget=1023 (below API minimum of 1024)."""
+        result = await _consult(
+            query="test",
+            session_id="test-budget-floor",
+            model_alias="opus",
+            thinking_budget=1023,
+        )
+        assert "Error" in result
+        assert "1024" in result
+
+    @pytest.mark.asyncio
+    async def test_consult_rejects_budget_1000(self):
+        """_consult should reject thinking_budget=1000 (below API minimum of 1024)."""
+        result = await _consult(
+            query="test",
+            session_id="test-budget-floor-1000",
+            model_alias="opus",
+            thinking_budget=1000,
+        )
+        assert "Error" in result
+        assert "1024" in result
+
+    @pytest.mark.asyncio
+    async def test_consult_accepts_budget_1024(self, monkeypatch):
+        """_consult should accept thinking_budget=1024 without a validation error."""
+        import cpal.server as srv
+        # Patch run_agentic_loop so no real API call is made
+        async def fake_loop(*args, **kwargs):
+            msgs = kwargs.get("messages") or args[2]
+            return "ok", msgs
+        monkeypatch.setattr(srv, "run_agentic_loop", fake_loop)
+        monkeypatch.setattr(srv, "_api_key", "fake-key")
+        import anthropic
+        monkeypatch.setattr(srv, "_client", anthropic.AsyncAnthropic(api_key="fake-key"))
+
+        result = await _consult(
+            query="test",
+            session_id="test-budget-1024",
+            model_alias="sonnet",
+            thinking_budget=1024,
+        )
+        # Should not be a validation error about 1024
+        assert "1024" not in result or "Error" not in result
+
+    @pytest.mark.asyncio
+    async def test_count_tokens_rejects_budget_1023(self, monkeypatch):
+        """count_tokens should reject thinking_budget=1023."""
+        import cpal.server as srv
+        monkeypatch.setattr(srv, "_api_key", "fake-key")
+
+        result = await srv.count_tokens(
+            query="test",
+            model="opus",
+            thinking_budget=1023,
+        )
+        assert "error" in result
+        assert "1024" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_create_batch_rejects_budget_1023(self, monkeypatch):
+        """create_batch should reject thinking_budget=1023."""
+        import cpal.server as srv
+        monkeypatch.setattr(srv, "_api_key", "fake-key")
+
+        result = await srv.create_batch(
+            queries=[{"custom_id": "q1", "query": "test"}],
+            model="opus",
+            thinking_budget=1023,
+        )
+        assert "error" in result
+        assert "1024" in result["error"]
+
+    def test_limits_resource_shows_1024(self):
+        """resource://config/limits should report the correct API minimum of 1024."""
+        from cpal.server import get_limits
+        limits = get_limits()
+        budget_range = limits["thinking_budget_range"]
+        assert budget_range[0] == 1024, (
+            f"thinking_budget_range floor should be 1024, got {budget_range[0]}"
+        )
+
+
+class TestListBatchesLimit:
+    """F14: list_batches should stop fetching once len(batches) >= limit.
+
+    The Anthropic SDK auto-paginates; the `limit` arg is a page size, not a
+    total cap.  Without a break, list_batches(limit=5) can return hundreds of
+    batches and silently ignore the caller's intent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_list_batches_respects_limit(self, monkeypatch):
+        """list_batches must stop collecting once it has `limit` entries."""
+        import cpal.server as srv
+
+        class FakeBatch:
+            def __init__(self, i):
+                self.id = f"batch_{i}"
+                self.processing_status = "ended"
+                self.created_at = "2026-01-01T00:00:00Z"
+                self.request_counts = None
+                self.ended_at = None
+
+        class FakeBatchList:
+            """Async iterator that yields 50 batches."""
+            def __init__(self, limit=20):
+                self._limit = limit
+                self._index = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                # Yield up to 50 even if SDK limit says less — simulates auto-pagination
+                if self._index >= 50:
+                    raise StopAsyncIteration
+                batch = FakeBatch(self._index)
+                self._index += 1
+                return batch
+
+        class FakeBatches:
+            def list(self, limit=20):
+                return FakeBatchList(limit)
+
+        class FakeMessages:
+            batches = FakeBatches()
+
+        class FakeClient:
+            messages = FakeMessages()
+
+        monkeypatch.setattr(srv, "_client", FakeClient())
+
+        result = await srv.list_batches(limit=5)
+        assert "error" not in result
+        assert result["count"] == 5, (
+            f"Expected 5 batches with limit=5 (got {result['count']}); "
+            "SDK auto-paginates past limit — need explicit break"
+        )
+        assert len(result["batches"]) == 5
+
+
+class TestCreateBatchEffortDefault:
+    """F16: create_batch should default effort=None, not effort='max'.
+
+    'max' effort on adaptive models maximises output tokens — a silent cost
+    amplifier on bulk jobs that contradicts the batch API's cost-saving purpose
+    and is inconsistent with consult_claude's effort=None default.
+    """
+
+    def test_create_batch_default_effort_is_none(self):
+        """create_batch should default effort=None (not 'max')."""
+        import inspect
+        from cpal.server import create_batch
+        from typing import cast
+        from collections.abc import Callable
+        fn = cast(Callable[..., Any], getattr(create_batch, "fn", create_batch))
+        sig = inspect.signature(fn)
+        default = sig.parameters["effort"].default
+        assert default is None, (
+            f"create_batch effort default should be None, got {default!r}; "
+            "'max' effort silently amplifies cost on all batch jobs"
+        )
+
+
+class TestGitToolExceptionWrapping:
+    """F26: execute_git call in execute_tool should be wrapped in try/except.
+
+    If the model sends max_count as a string, min(max(1, "20"), 100) raises
+    TypeError.  Without a try/except this propagates and kills the entire
+    agentic turn.  The git branch should follow the same pattern as every
+    other tool branch and return an "Error: ..." string.
+    """
+
+    def test_execute_tool_git_with_string_max_count_returns_error(self):
+        """String max_count should not raise — should return an Error string."""
+        # Simulate what Claude might send: max_count as a string
+        result = execute_tool("git", {
+            "subcommand": "log",
+            "max_count": "20",  # string, not int — triggers TypeError without coercion
+        })
+        # Must not raise; must return a string (either error or real output)
+        assert isinstance(result, str)
+        # Should not be an unhandled exception traceback
+        assert "TypeError" not in result
+        assert "Traceback" not in result
+
+    def test_execute_git_coerces_string_max_count(self):
+        """execute_git should coerce max_count to int defensively."""
+        from cpal.git_tools import execute_git
+        # This must not raise TypeError
+        result = execute_git({"subcommand": "log", "max_count": "5"})
+        assert isinstance(result, str)
+        assert "TypeError" not in result
+
+
+class TestCpalMaxToolCallsValidation:
+    """F27: CPAL_MAX_TOOL_CALLS env var — invalid/< 1 should NOT silently use default.
+
+    The current code swallows ValueError and uses defaults with no warning,
+    so an operator who set CPAL_MAX_TOOL_CALLS=abc gets a misleading sense of
+    control.  The fix moves validation to main() or raises at startup.
+
+    This test validates the module-level behavior by checking whether the
+    DEFAULT_TOOL_CALLS dict reflects the env var when set to a valid value,
+    and that an explicit invalid/zero value is treated as an error in main().
+    """
+
+    def test_main_exits_on_zero_max_tool_calls(self, monkeypatch):
+        """main() should sys.exit when CPAL_MAX_TOOL_CALLS=0 is set."""
+        import cpal.server as srv
+        monkeypatch.setenv("CPAL_MAX_TOOL_CALLS", "0")
+        with pytest.raises(SystemExit):
+            srv._validate_max_tool_calls_env()
+
+    def test_main_exits_on_negative_max_tool_calls(self, monkeypatch):
+        """main() should sys.exit when CPAL_MAX_TOOL_CALLS=-1 is set."""
+        import cpal.server as srv
+        monkeypatch.setenv("CPAL_MAX_TOOL_CALLS", "-1")
+        with pytest.raises(SystemExit):
+            srv._validate_max_tool_calls_env()
+
+    def test_main_exits_on_non_integer_max_tool_calls(self, monkeypatch):
+        """main() should sys.exit when CPAL_MAX_TOOL_CALLS=abc is set."""
+        import cpal.server as srv
+        monkeypatch.setenv("CPAL_MAX_TOOL_CALLS", "abc")
+        with pytest.raises(SystemExit):
+            srv._validate_max_tool_calls_env()
+
+    def test_valid_max_tool_calls_accepted(self, monkeypatch):
+        """CPAL_MAX_TOOL_CALLS=50 should be accepted without error."""
+        import cpal.server as srv
+        monkeypatch.setenv("CPAL_MAX_TOOL_CALLS", "50")
+        # Should not raise
+        srv._validate_max_tool_calls_env()
+
+
+class TestSystemPromptFileFailFast:
+    """F27: --system-prompt FILE that cannot be read should fail fast.
+
+    A user who explicitly passed a prompt file (possibly policy/safety text)
+    silently runs without it — this violates the project's crash > silent
+    fallback principle.  The fix: raise SystemExit for CLI --system-prompt
+    failures while keeping warn-and-continue for config.toml paths.
+    """
+
+    def test_cli_system_prompt_missing_file_raises(self, monkeypatch, tmp_path):
+        """_build_system_prompt should raise SystemExit for missing CLI prompt files."""
+        import cpal.server as srv
+        nonexistent = str(tmp_path / "nonexistent.md")
+        with pytest.raises(SystemExit):
+            srv._build_system_prompt(
+                config={},
+                cli_prompt_files=[nonexistent],
+                fail_fast_cli=True,
+            )
+
+    def test_config_system_prompt_missing_file_warns_not_raises(
+        self, monkeypatch, caplog, tmp_path
+    ):
+        """config.toml system_prompts files that don't exist should warn, not exit."""
+        import logging
+        import cpal.server as srv
+        nonexistent = str(tmp_path / "nonexistent.md")
+        with caplog.at_level(logging.WARNING, logger="cpal"):
+            # Should NOT raise
+            result, sources = srv._build_system_prompt(
+                config={"system_prompts": [nonexistent]},
+            )
+        # Should warn
+        assert any("nonexistent" in r.message or "Error" in r.message for r in caplog.records), \
+            "Expected a warning log for missing config system_prompts file"
+
+    def test_config_inline_system_prompt_non_str_warns(self, caplog, tmp_path):
+        """config.toml system_prompt of wrong type should log a warning."""
+        import logging
+        import cpal.server as srv
+        with caplog.at_level(logging.WARNING, logger="cpal"):
+            result, sources = srv._build_system_prompt(
+                config={"system_prompt": 12345},
+            )
+        assert any("system_prompt" in r.message.lower() for r in caplog.records), \
+            "Expected a warning for non-str system_prompt config value"
+
+
+class TestConsultExceptionHandling:
+    """F28: _consult blanket except should use logger.exception (traceback preserved)
+    and re-raise non-anthropic.APIError exceptions.
+
+    Currently cpal bugs become chat strings like "Error: 'model'" with no
+    traceback.  The fix: logger.exception keeps the trace; re-raising non-API
+    errors means FastMCP surfaces a proper tool error instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_internal_exception_propagates(self, monkeypatch):
+        """Non-APIError exceptions inside _consult should propagate, not be caught."""
+        import cpal.server as srv
+        import anthropic
+
+        # Patch run_agentic_loop to raise a cpal-internal bug
+        async def bad_loop(*args, **kwargs):
+            raise KeyError("model")  # simulates an internal cpal bug
+
+        monkeypatch.setattr(srv, "run_agentic_loop", bad_loop)
+        monkeypatch.setattr(srv, "_api_key", "fake-key")
+        monkeypatch.setattr(srv, "_client", anthropic.AsyncAnthropic(api_key="fake-key"))
+
+        # Internal exceptions should propagate (not be swallowed as "Error: 'model'" strings)
+        with pytest.raises(KeyError):
+            await _consult(
+                query="test",
+                session_id="test-exception-propagate",
+                model_alias="sonnet",
+            )
+
+
+class TestCreateBatchAnnotations:
+    """F33: create_batch should have readOnlyHint=False (it creates remote state and spends money).
+
+    Hosts may auto-approve read-only tools.  Calling create_batch with
+    readOnlyHint=True means it can be silently approved for potentially
+    expensive batch operations.
+
+    consult_claude is readOnlyHint=True by documented judgment: it does not
+    mutate any persistent external state beyond ephemeral in-memory session
+    history, and the MCP session is the user's explicit intent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_create_batch_not_readonly(self):
+        """create_batch registered tool must have readOnlyHint=False.
+
+        The old test used getattr(create_batch, 'annotations', None) on the bare
+        function — FastMCP wraps tools and that attribute is always None on the
+        unwrapped function, so the assertion never ran.  We now query the FastMCP
+        registry directly via mcp.get_tool() to get the actual registered metadata.
+        """
+        from cpal.server import mcp
+        tool = await mcp.get_tool("create_batch")
+        assert tool is not None, "create_batch must be registered with the MCP server"
+        annotations = getattr(tool, "annotations", None)
+        assert annotations is not None, (
+            "create_batch has no annotations — readOnlyHint=False must be set "
+            "to prevent hosts from auto-approving this expensive mutation"
+        )
+        read_only = getattr(annotations, "readOnlyHint", None)
+        assert read_only is False, (
+            f"create_batch readOnlyHint should be False, got {read_only!r}; "
+            "it creates remote state and spends money"
+        )
+
+    @pytest.mark.asyncio
+    async def test_consult_claude_is_readonly(self):
+        """consult_claude registered tool must have readOnlyHint=True (documented judgment call).
+
+        consult_claude does not mutate any persistent external state beyond ephemeral
+        in-memory session history; the session is the user's explicit intent.
+        This symmetry test ensures neither annotation is accidentally swapped.
+        """
+        from cpal.server import mcp
+        tool = await mcp.get_tool("consult_claude")
+        assert tool is not None, "consult_claude must be registered with the MCP server"
+        annotations = getattr(tool, "annotations", None)
+        assert annotations is not None, "consult_claude has no annotations"
+        read_only = getattr(annotations, "readOnlyHint", None)
+        assert read_only is True, (
+            f"consult_claude readOnlyHint should be True (documented judgment call), "
+            f"got {read_only!r}"
+        )
+
+
+class TestMaxTokensClamp:
+    """F12: max_tokens must be clamped to a per-model output cap.
+
+    Fable 5 / Opus 4.6+: 128000 tokens max output.
+    Sonnet 4.6 / Haiku 4.5 and unknown models: 64000 conservative default.
+
+    Also: budget_tokens must stay strictly less than the clamped max_tokens.
+    """
+
+    def test_model_output_caps_constant_exists(self):
+        """MODEL_OUTPUT_CAPS must be exported from server."""
+        assert isinstance(MODEL_OUTPUT_CAPS, dict)
+        assert len(MODEL_OUTPUT_CAPS) > 0
+
+    def test_default_output_cap_exists(self):
+        """DEFAULT_OUTPUT_CAP must be exported from server."""
+        assert isinstance(DEFAULT_OUTPUT_CAP, int)
+        assert DEFAULT_OUTPUT_CAP == 64000
+
+    def test_fable_cap_is_128k(self):
+        """Fable 5 output cap should be 128000 via _get_output_cap.
+
+        MODEL_OUTPUT_CAPS values are (floor_tuple, cap_int) — not bare ints.
+        The old test compared MODEL_OUTPUT_CAPS.get("fable") == 128000, which
+        was always False (the value is a tuple), so it silently fell through to
+        the trivially-true `any("fable" in k ...)` fallback.
+        """
+        cap = _get_output_cap("claude-fable-5")
+        assert cap == 128000, (
+            f"_get_output_cap('claude-fable-5') should be 128000, got {cap}"
+        )
+        # Opus 4.6+ also gets 128K
+        cap_opus46 = _get_output_cap("claude-opus-4-6")
+        assert cap_opus46 == 128000, (
+            f"_get_output_cap('claude-opus-4-6') should be 128000, got {cap_opus46}"
+        )
+        # Conservative default for haiku and unknown models
+        cap_haiku = _get_output_cap("claude-haiku-4-5")
+        assert cap_haiku == DEFAULT_OUTPUT_CAP, (
+            f"_get_output_cap('claude-haiku-4-5') should be {DEFAULT_OUTPUT_CAP}, got {cap_haiku}"
+        )
+        cap_unknown = _get_output_cap("some-unknown-model-99")
+        assert cap_unknown == DEFAULT_OUTPUT_CAP, (
+            f"_get_output_cap('some-unknown-model-99') should be {DEFAULT_OUTPUT_CAP}, got {cap_unknown}"
+        )
+
+    def test_haiku_cap_is_64k(self):
+        """Haiku output cap should be 64000."""
+        # Haiku is not adaptive; large budget should be clamped
+        kwargs = build_thinking_kwargs(
+            "claude-haiku-4-5",
+            extended_thinking=True,
+            thinking_budget=80000,  # exceeds 64000 cap
+        )
+        assert "max_tokens" in kwargs
+        assert kwargs["max_tokens"] <= 64000, (
+            f"max_tokens {kwargs['max_tokens']} exceeds 64k cap for haiku"
+        )
+
+    def test_opus_46_cap_is_128k(self):
+        """Opus 4.6+ is adaptive — no max_tokens bump needed."""
+        # adaptive models don't set max_tokens in build_thinking_kwargs
+        kwargs = build_thinking_kwargs(
+            "claude-opus-4-6",
+            extended_thinking=True,
+            thinking_budget=10000,
+        )
+        # adaptive → max_tokens not set by the helper (loop uses its own default)
+        assert "max_tokens" not in kwargs
+
+    def test_non_adaptive_large_budget_clamped(self):
+        """A 100000-token budget for haiku should be clamped so max_tokens <= 64000."""
+        kwargs = build_thinking_kwargs(
+            "claude-haiku-4-5",
+            extended_thinking=True,
+            thinking_budget=100000,
+        )
+        assert "max_tokens" in kwargs
+        assert kwargs["max_tokens"] <= DEFAULT_OUTPUT_CAP
+
+    def test_budget_strictly_less_than_max_tokens(self):
+        """For haiku with budget=100000, build_thinking_kwargs must clamp max_tokens to
+        the haiku output cap (64000) AND budget_tokens must be strictly less than that.
+
+        The old unclamped code returned max_tokens = budget + 8000 = 108000 > cap,
+        so a test that only checked budget < max_tokens would pass even without the fix.
+        We assert the actual clamped value to catch a regression where clamping is removed.
+        """
+        kwargs = build_thinking_kwargs(
+            "claude-haiku-4-5",
+            extended_thinking=True,
+            thinking_budget=100000,  # far exceeds 64000 cap
+        )
+        assert "max_tokens" in kwargs, "non-adaptive model must set max_tokens"
+        assert kwargs["max_tokens"] == DEFAULT_OUTPUT_CAP, (
+            f"haiku max_tokens should be clamped to {DEFAULT_OUTPUT_CAP} (64000), "
+            f"got {kwargs['max_tokens']}; old unclamped code would give 108000"
+        )
+        budget = kwargs["thinking"]["budget_tokens"]
+        assert budget < DEFAULT_OUTPUT_CAP, (
+            f"budget_tokens ({budget}) must be < clamped max_tokens ({DEFAULT_OUTPUT_CAP})"
+        )
+
+    def test_budget_reduction_note_in_kwargs_or_clamp_correct(self):
+        """Every key returned by build_thinking_kwargs must be a valid Messages API param.
+
+        Regression test for any future _budget_note / internal key leaking into kwargs.update().
+        The only allowed keys are 'thinking' and 'max_tokens'.  Any other key would be
+        passed straight to the Anthropic SDK and cause a TypeError or 400 error.
+        """
+        allowed_keys = {"thinking", "max_tokens"}
+
+        # adaptive model — thinking only, no max_tokens
+        kwargs_adaptive = build_thinking_kwargs(
+            "claude-fable-5",
+            extended_thinking=True,
+        )
+        unexpected = set(kwargs_adaptive.keys()) - allowed_keys
+        assert not unexpected, (
+            f"Adaptive build_thinking_kwargs returned unexpected keys: {unexpected}; "
+            f"only {allowed_keys} are valid Messages API params"
+        )
+
+        # non-adaptive, normal budget
+        kwargs_manual = build_thinking_kwargs(
+            "claude-haiku-4-5",
+            extended_thinking=True,
+            thinking_budget=10000,
+        )
+        unexpected = set(kwargs_manual.keys()) - allowed_keys
+        assert not unexpected, (
+            f"Manual build_thinking_kwargs returned unexpected keys: {unexpected}"
+        )
+
+        # non-adaptive, over-cap budget (triggers internal reduction path)
+        kwargs_reduced = build_thinking_kwargs(
+            "claude-haiku-4-5",
+            extended_thinking=True,
+            thinking_budget=90000,
+        )
+        unexpected = set(kwargs_reduced.keys()) - allowed_keys
+        assert not unexpected, (
+            f"Budget-reduced build_thinking_kwargs returned unexpected keys: {unexpected}; "
+            f"a _budget_note or other internal key would be passed to kwargs.update() "
+            f"and cause a SDK TypeError"
+        )
+
+        # extended_thinking=False — empty dict
+        kwargs_disabled = build_thinking_kwargs(
+            "claude-haiku-4-5",
+            extended_thinking=False,
+        )
+        unexpected = set(kwargs_disabled.keys()) - allowed_keys
+        assert not unexpected, (
+            f"Disabled build_thinking_kwargs returned unexpected keys: {unexpected}"
+        )
+
+    def test_normal_budget_unclamped_for_large_model(self):
+        """A 10000-token budget for a non-adaptive old-sonnet should fit without clamping."""
+        # Use an old sonnet (non-adaptive, smaller cap scenario is not triggered)
+        kwargs = build_thinking_kwargs(
+            "claude-sonnet-4-5",
+            extended_thinking=True,
+            thinking_budget=10000,
+        )
+        assert "max_tokens" in kwargs
+        max_tok = kwargs["max_tokens"]
+        budget = kwargs["thinking"]["budget_tokens"]
+        # 10000 + 8000 = 18000, well within 64000
+        assert max_tok == 18000
+        assert budget == 10000
+        assert budget < max_tok
+
+    def test_unknown_model_gets_conservative_cap(self):
+        """Unknown/unrecognized model IDs get the conservative 64000 cap."""
+        kwargs = build_thinking_kwargs(
+            "some-unknown-model-99-9",
+            extended_thinking=True,
+            thinking_budget=80000,
+        )
+        assert "max_tokens" in kwargs
+        assert kwargs["max_tokens"] <= DEFAULT_OUTPUT_CAP

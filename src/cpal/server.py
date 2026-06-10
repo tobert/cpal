@@ -13,6 +13,7 @@ import base64
 import glob as globlib
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -56,9 +57,14 @@ DEFAULT_TOOL_CALLS = {
     "haiku": 1000,
     "sonnet": 1000,
     "opus": 1000,
+    "fable": 1000,
 }
 
-# Override per-tier defaults with CPAL_MAX_TOOL_CALLS env var
+# Override per-tier defaults with CPAL_MAX_TOOL_CALLS env var.
+# Module-level: apply the override if the value is valid; leave defaults
+# alone for invalid values.  Explicit startup validation is deferred to
+# _validate_max_tool_calls_env(), which main() calls — this avoids binding
+# sys.exit() to import time (which would break tests that import the module).
 _max_tool_calls_override = os.getenv("CPAL_MAX_TOOL_CALLS")
 if _max_tool_calls_override is not None:
     try:
@@ -66,20 +72,84 @@ if _max_tool_calls_override is not None:
         if _override >= 1:
             DEFAULT_TOOL_CALLS = {k: _override for k in DEFAULT_TOOL_CALLS}
     except ValueError:
-        pass  # Ignore invalid values, use defaults
+        pass  # main() will call _validate_max_tool_calls_env() and exit
+
+
+def _validate_max_tool_calls_env() -> None:
+    """Validate CPAL_MAX_TOOL_CALLS and exit with a clear message if invalid.
+
+    F27: an operator who sets CPAL_MAX_TOOL_CALLS=abc or CPAL_MAX_TOOL_CALLS=0
+    silently gets no cap in the current code (the except-pass swallows the
+    error).  This function is called by main() at startup so the server exits
+    with a clear error rather than running with unexpected limits.
+
+    Not called at import time so that tests can import the module freely.
+    """
+    raw = os.getenv("CPAL_MAX_TOOL_CALLS")
+    if raw is None:
+        return
+    try:
+        value = int(raw)
+    except ValueError:
+        print(
+            f"Error: CPAL_MAX_TOOL_CALLS={raw!r} is not a valid integer.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if value < 1:
+        print(
+            f"Error: CPAL_MAX_TOOL_CALLS={value} must be >= 1.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 FALLBACK_ALIASES: dict[str, str] = {
-    "haiku": "claude-haiku-4-5-20251001",    # Haiku 4.5
-    "sonnet": "claude-sonnet-4-6",           # Sonnet 4.6
-    "opus": "claude-opus-4-6",               # Opus 4.6
+    "haiku": "claude-haiku-4-5",     # Haiku 4.5
+    "sonnet": "claude-sonnet-4-6",   # Sonnet 4.6
+    "opus": "claude-opus-4-8",       # Opus 4.8
+    "fable": "claude-fable-5",       # Fable 5
 }
 
 # Known tiers we care about
-KNOWN_TIERS = {"haiku", "sonnet", "opus"}
+KNOWN_TIERS = {"haiku", "sonnet", "opus", "fable"}
+
+# Tier descriptions shared by list_models and resource://models
+TIER_DESCRIPTIONS = {
+    "fable": "Most capable — frontier intelligence, premium cost",
+    "opus": "Deep reasoning, hard problems",
+    "sonnet": "Balanced reasoning, code review",
+    "haiku": "Fast exploration, quick questions",
+}
+
+# Per-tier maximum output token caps (Anthropic model limits).
+# Fable 5 and Opus 4.6+ support 128K output; everything else (Sonnet 4.6,
+# Haiku 4.5, and any unrecognised model) gets a conservative 64K cap.
+# These floors mirror _ADAPTIVE_THINKING_FLOORS but apply to *all* models
+# (adaptive or manual) when computing the max_tokens ceiling.
+MODEL_OUTPUT_CAPS: dict[str, tuple[tuple[int, int], int]] = {
+    # tier → ((major, minor) floor, cap_tokens)
+    "fable": ((5, 0), 128000),
+    "opus":  ((4, 6), 128000),
+    # Sonnet 4.6 gets 64K — same as the conservative default.
+    # (No special entry needed; it falls through to DEFAULT_OUTPUT_CAP.)
+}
+# Conservative cap for tiers/versions not listed above (Sonnet, Haiku, unknown)
+DEFAULT_OUTPUT_CAP = 64000
+
+# Minimum thinking budget accepted by the Anthropic API.  The SDK returns a
+# 400 for any budget < 1024, even though it looks like a round number.
+MIN_THINKING_BUDGET = 1024
 
 # Lazy-init cache for discovered models
 _discovered_models: dict[str, str] | None = None
-_models_lock = asyncio.Lock()
+# _models_lock is created lazily inside the running event loop (see get_model_aliases).
+# asyncio.Lock() created at module-import time binds to the first loop that acquires it;
+# pytest-asyncio (function-scoped loops) creates a fresh loop per test, which would cause
+# RuntimeError("bound to a different event loop") on the second async test.  Lazy creation
+# inside get_model_aliases() ensures the lock always belongs to the *current* running loop.
+_models_lock: asyncio.Lock | None = None
+# Threading lock guards the lazy-init of _models_lock itself (cheap, no await inside).
+_models_lock_init = threading.Lock()
 
 
 async def _fetch_latest_models() -> dict[str, str] | None:
@@ -121,10 +191,20 @@ async def get_model_aliases() -> dict[str, str]:
     Double-checked locking with asyncio.Lock. Only caches successful
     discovery — fallback results are never cached so the next call
     retries the API.
+
+    _models_lock is created lazily here (inside the running loop) rather than
+    at module-import time to avoid binding it to the first event loop — which
+    would raise RuntimeError in test suites that spin up a new loop per test.
     """
-    global _discovered_models
+    global _discovered_models, _models_lock
     if _discovered_models is not None:
         return _discovered_models
+    # Lazily create the asyncio.Lock inside the currently-running event loop.
+    # The threading lock prevents two coroutines from both entering this block
+    # on the very first call and each creating their own asyncio.Lock.
+    with _models_lock_init:
+        if _models_lock is None:
+            _models_lock = asyncio.Lock()
     async with _models_lock:
         if _discovered_models is not None:
             return _discovered_models
@@ -134,9 +214,69 @@ async def get_model_aliases() -> dict[str, str]:
             return _discovered_models
         return FALLBACK_ALIASES.copy()
 
+# Parses tier and version from a model ID. The minor-version group is capped
+# at 2 digits so date suffixes don't parse as minors (claude-opus-4-20250514
+# is Opus 4.0, not Opus 4.20250514).
+_MODEL_VERSION_RE = re.compile(
+    r"claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2})(?!\d))?"
+)
+
+# Minimum (major, minor) per tier for adaptive thinking. On Fable 5 and
+# Opus 4.7+ manual thinking (budget_tokens) is *removed* and returns a 400,
+# so getting this wrong is fatal, not just suboptimal.
+_ADAPTIVE_THINKING_FLOORS = {"fable": (5, 0), "opus": (4, 6), "sonnet": (4, 6)}
+
+# Tiers where thinking text is omitted by default and must be requested
+# via display: "summarized" (Fable 5, Opus 4.7+).
+_SUMMARIZED_DISPLAY_FLOORS = {"fable": (5, 0), "opus": (4, 7)}
+
+
+def _model_meets_floor(model: str, floors: dict[str, tuple[int, int]]) -> bool:
+    """Check whether a model ID's tier+version meets a per-tier floor."""
+    m = _MODEL_VERSION_RE.search(model)
+    if not m:
+        return False
+    tier = m.group(1)
+    version = (int(m.group(2)), int(m.group(3) or 0))
+    floor = floors.get(tier)
+    return floor is not None and version >= floor
+
+
 def _supports_adaptive_thinking(model: str) -> bool:
-    """Check if model supports adaptive thinking (Opus 4.6+, Sonnet 4.6+)."""
-    return "claude-opus-4-6" in model or "claude-sonnet-4-6" in model
+    """Check if model supports adaptive thinking (Fable 5, Opus 4.6+, Sonnet 4.6+)."""
+    return _model_meets_floor(model, _ADAPTIVE_THINKING_FLOORS)
+
+
+def _get_output_cap(model: str) -> int:
+    """Return the maximum output token count for a model.
+
+    Fable 5 and Opus 4.6+ support 128K output tokens.
+    Everything else (Sonnet 4.6, Haiku 4.5, unknown models) gets a
+    conservative 64K cap (DEFAULT_OUTPUT_CAP).
+    """
+    m = _MODEL_VERSION_RE.search(model)
+    if not m:
+        return DEFAULT_OUTPUT_CAP
+    tier = m.group(1)
+    version = (int(m.group(2)), int(m.group(3) or 0))
+    entry = MODEL_OUTPUT_CAPS.get(tier)
+    if entry is not None:
+        floor, cap = entry
+        if version >= floor:
+            return cap
+    return DEFAULT_OUTPUT_CAP
+
+
+def _adaptive_thinking_config(model: str) -> dict[str, str]:
+    """Build the adaptive thinking param for a model.
+
+    Fable 5 and Opus 4.7+ omit thinking text by default; cpal surfaces
+    thinking to callers, so request the summarized display there.
+    """
+    config = {"type": "adaptive"}
+    if _model_meets_floor(model, _SUMMARIZED_DISPLAY_FLOORS):
+        config["display"] = "summarized"
+    return config
 
 
 # MIME type mappings for multimodal support
@@ -267,6 +407,7 @@ def _build_system_prompt(
     config: dict,
     cli_prompt_files: list[str] | None = None,
     no_default: bool = False,
+    fail_fast_cli: bool = False,
 ) -> tuple[str, list[str]]:
     """Compose the system prompt from config, files, and CLI flags.
 
@@ -278,6 +419,15 @@ def _build_system_prompt(
     2. Files from config.toml system_prompts list
     3. Inline system_prompt from config.toml
     4. Files from --system-prompt CLI flags
+
+    F27 error-handling policy:
+    - config.toml system_prompts paths that fail: warn-and-continue (optional
+      config that may simply not exist on this machine).
+    - CLI --system-prompt files that fail: sys.exit(1) when fail_fast_cli=True
+      (the operator explicitly passed the file and may depend on its contents
+      for policy or safety text).
+    - config.toml system_prompt of wrong type: warn (config format error, not
+      an explicit operator action).
     """
     parts: list[str] = []
     sources: list[str] = []
@@ -307,9 +457,18 @@ def _build_system_prompt(
 
     # 3. Inline system_prompt from config.toml
     inline = config.get("system_prompt")
-    if inline and isinstance(inline, str):
-        parts.append(inline.strip())
-        sources.append("config.toml (inline)")
+    if inline is not None:
+        if isinstance(inline, str):
+            if inline:
+                parts.append(inline.strip())
+                sources.append("config.toml (inline)")
+        else:
+            # F27: non-str system_prompt silently dropped — emit a warning so
+            # the user knows their config.toml has a type error.
+            logger.warning(
+                "Config 'system_prompt' must be a string, got %s; ignoring.",
+                type(inline).__name__,
+            )
 
     # 4. CLI --system-prompt files
     for path_str in cli_prompt_files or []:
@@ -319,6 +478,15 @@ def _build_system_prompt(
             parts.append(content.strip())
             sources.append(f"--system-prompt {expanded}")
         except (OSError, UnicodeDecodeError) as e:
+            if fail_fast_cli:
+                # F27: the operator explicitly passed this file — fail fast
+                # rather than silently running without it (it may contain
+                # policy or safety text the operator depends on).
+                print(
+                    f"Error: Cannot read --system-prompt file {expanded}: {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             logger.warning("Error reading CLI system prompt %s: %s", expanded, e)
 
     if not parts:
@@ -366,20 +534,34 @@ def cleanup_old_sessions() -> int:
     Remove sessions that haven't been accessed within SESSION_TTL.
 
     Returns count removed. Must be called with _sessions_lock held.
+
+    F6 fix: a session whose asyncio lock is currently held has an active
+    _consult running inside the agentic loop.  Deleting it would silently
+    discard that turn's history when the loop writes back to `session`.
+    We skip both the session AND its lock if the lock is held.
+    The lock check must happen BEFORE deleting the session, not just before
+    deleting the lock.
     """
     now = time.time()
-    to_remove = [
+    # Candidate expired sessions — but we must still gate on lock.locked()
+    expired = [
         sid for sid, sess in sessions.items()
         if now - sess.get("last_access", 0) > SESSION_TTL
     ]
+    to_remove = []
+    with _locks_lock:
+        for sid in expired:
+            lock = _session_locks.get(sid)
+            if lock is not None and lock.locked():
+                # An active _consult holds this lock — skip the session entirely.
+                # It will be eligible for cleanup on the next sweep once released.
+                continue
+            to_remove.append(sid)
+            # Safe to remove the lock too (it is unheld or doesn't exist)
+            if lock is not None:
+                del _session_locks[sid]
     for sid in to_remove:
         del sessions[sid]
-    # Clean up locks for removed sessions (only if not currently held)
-    with _locks_lock:
-        for sid in to_remove:
-            lock = _session_locks.get(sid)
-            if lock is not None and not lock.locked():
-                del _session_locks[sid]
     return len(to_remove)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -524,7 +706,16 @@ def execute_tool(name: str, input_data: dict[str, Any]) -> str:
             return f"Error searching project: {e}"
 
     elif name == "git":
-        return execute_git(input_data)
+        # F26: every other tool branch is exception-wrapped; wrap the git
+        # branch too so that malformed tool input (e.g. max_count sent as a
+        # string) returns an error string instead of propagating a TypeError
+        # through run_agentic_loop and killing the entire turn.
+        # F21: pass _project_root so execute_git pins the subprocess CWD and
+        # intersects the git toplevel with the advertised sandbox boundary.
+        try:
+            return execute_git(input_data, project_root=_project_root)
+        except Exception as e:
+            return f"Error: {e}"
 
     return f"Unknown tool: {name}"
 
@@ -580,6 +771,21 @@ async def get_session(session_id: str, model_alias: str) -> dict[str, Any]:
         if current_model != target_model:
             logger.info(f"Migrating session '{session_id}': {current_model} → {target_model}")
             session["model"] = target_model
+            # Strip thinking/redacted_thinking blocks from all stored assistant
+            # messages.  Thinking blocks are signed by the generating model; they
+            # cannot be replayed to a different model and may trigger API errors.
+            # Text blocks are preserved so the conversation history stays coherent.
+            cleaned: list[dict] = []
+            for msg in session["messages"]:
+                if msg["role"] == "assistant":
+                    stripped_content = [
+                        block for block in msg["content"]
+                        if getattr(block, "type", None) not in ("thinking", "redacted_thinking")
+                    ]
+                    cleaned.append({"role": "assistant", "content": stripped_content})
+                else:
+                    cleaned.append(msg)
+            session["messages"] = cleaned
 
         return session
 
@@ -683,6 +889,171 @@ def _filter_thinking_blocks(content: list, thinking_enabled: bool) -> list:
     ]
 
 
+def _prune_messages(
+    messages: list[dict[str, Any]],
+    max_count: int,
+) -> list[dict[str, Any]]:
+    """
+    Prune a message list to at most *max_count* entries while preserving
+    conversation structure.
+
+    Naive tail-slicing can produce a head that:
+      • starts with an assistant message  (API requires first message = user)
+      • starts with a user message whose content is tool_result blocks
+        (orphaned results — their tool_use was just sliced away)
+
+    This function walks backward from the natural cut point and moves the
+    cut forward until the retained head is a plain user message: a user
+    message whose content contains no tool_result blocks.
+
+    If no safe cut point exists (i.e. the entire list is tool rounds with
+    no plain user turn) the messages are returned unmodified to avoid data
+    loss — this should never happen in practice given how sessions are built.
+    """
+    if len(messages) <= max_count:
+        return list(messages)
+
+    # Candidate start index from naive tail-slice
+    candidate = len(messages) - max_count
+
+    # Walk forward from candidate until we land on a plain user message
+    for i in range(candidate, len(messages)):
+        msg = messages[i]
+        if msg["role"] != "user":
+            continue
+        content = msg.get("content", [])
+        # A "plain" user message has text (or other non-tool_result) content.
+        # A user message that is *only* tool_result blocks is the result half
+        # of a tool round whose tool_use assistant message was already sliced.
+        if isinstance(content, list):
+            has_tool_result = any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content
+            )
+            if has_tool_result:
+                # This is a tool_result user message — not a safe head.
+                # Skip it so we advance past the entire tool round.
+                continue
+        # Found a plain user turn — safe to cut here.
+        return list(messages[i:])
+
+    # No safe cut point found — return unmodified to avoid data loss
+    logger.warning(
+        "Could not find a safe pruning boundary in %d messages; history not pruned.",
+        len(messages),
+    )
+    return list(messages)
+
+
+def build_thinking_kwargs(
+    model: str,
+    extended_thinking: bool = True,
+    thinking_budget: int = 10000,
+) -> dict[str, Any]:
+    """
+    Build thinking-related kwargs for an API request.
+
+    Returns a dict with zero or more of: thinking, max_tokens.
+    Callers merge this into their base kwargs dict.
+
+    - extended_thinking=False → returns {} (no thinking injected)
+    - adaptive models (Fable 5, Opus 4.6+, Sonnet 4.6) → {thinking: {type: adaptive, ...}}
+      (no max_tokens bump; the model manages its own budget)
+    - non-adaptive models → {thinking: {type: enabled, budget_tokens: N},
+      max_tokens: clamped to per-model output cap}
+
+    The max_tokens value is clamped to the per-model output cap
+    (128K for Fable 5 / Opus 4.6+; 64K conservative default for others).
+    budget_tokens is reduced if necessary so it stays strictly less than
+    max_tokens (the API requires budget_tokens < max_tokens).  When budget
+    is reduced, a warning is logged. Every key in the returned dict must be
+    a valid Messages API parameter — callers merge it straight into kwargs.
+
+    Using this one helper in run_agentic_loop, count_tokens, and create_batch
+    ensures a single point of change when the thinking API evolves.
+    """
+    if not extended_thinking:
+        return {}
+
+    if _supports_adaptive_thinking(model):
+        return {"thinking": _adaptive_thinking_config(model)}
+
+    # Manual thinking: compute and clamp max_tokens to the model output cap.
+    output_cap = _get_output_cap(model)
+    # Provide 8 K of headroom above the thinking budget for the response text.
+    desired_max = max(16384, thinking_budget + 8000)
+    clamped_max = min(desired_max, output_cap)
+
+    # budget_tokens must be strictly less than max_tokens (API requirement).
+    # If the clamp leaves no room (budget >= clamped_max), reduce the budget.
+    effective_budget = thinking_budget
+    if effective_budget >= clamped_max:
+        # Leave at least 1024 tokens of output headroom (API lower bound)
+        effective_budget = max(MIN_THINKING_BUDGET, clamped_max - 1024)
+        logger.warning(
+            f"thinking_budget reduced from {thinking_budget} to {effective_budget} "
+            f"because it equalled or exceeded the model output cap ({output_cap})"
+        )
+
+    return {
+        "thinking": {"type": "enabled", "budget_tokens": effective_budget},
+        "max_tokens": clamped_max,
+    }
+
+
+def extract_text_and_thinking(content: list) -> tuple[str, str]:
+    """
+    Extract plain text and thinking narrative from a list of content blocks.
+
+    Returns (text, thinking_formatted) where:
+    - text is all text-block content joined by newlines
+    - thinking_formatted is all thinking-block content wrapped in <thinking> tags,
+      joined by double newlines (empty string if no thinking blocks)
+
+    Used in all run_agentic_loop exit paths to avoid triplication.
+    """
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
+
+    for block in content:
+        if getattr(block, "type", None) == "text":
+            text_parts.append(block.text)
+        elif getattr(block, "type", None) == "thinking":
+            thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
+
+    text = "\n".join(text_parts)
+    thinking = "\n\n".join(thinking_parts)
+    return text, thinking
+
+
+def _build_messages_for_request(
+    stored_messages: list[dict[str, Any]],
+    extended_thinking: bool,
+) -> list[dict[str, Any]]:
+    """
+    Build the messages list to send in an API request from stored session messages.
+
+    When extended_thinking is False, strips thinking/redacted_thinking blocks from
+    all assistant messages in the returned copy — the stored history is NOT mutated
+    so that re-enabling thinking in a later turn still has access to those blocks.
+    """
+    if extended_thinking:
+        # No filtering needed; shallow-copy to avoid callers mutating stored list
+        return list(stored_messages)
+
+    result = []
+    for msg in stored_messages:
+        if msg["role"] == "assistant":
+            filtered_content = [
+                block for block in msg["content"]
+                if getattr(block, "type", None) not in ("thinking", "redacted_thinking")
+            ]
+            result.append({"role": "assistant", "content": filtered_content})
+        else:
+            result.append(msg)
+    return result
+
+
 async def run_agentic_loop(
     client: anthropic.AsyncAnthropic,
     model: str,
@@ -700,7 +1071,7 @@ async def run_agentic_loop(
     Reports progress via ctx (MCP Context) when provided.
     Returns (response_text, updated_messages).
     """
-    # Build request kwargs
+    # Build request kwargs — base params
     kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": 16384,
@@ -713,19 +1084,13 @@ async def run_agentic_loop(
     if context_1m:
         kwargs["betas"] = [CONTEXT_1M_BETA]
 
-    # Thinking configuration — all models think by default
-    if extended_thinking:
-        if _supports_adaptive_thinking(model):
-            # Opus 4.6: adaptive thinking (model decides when/how much)
-            kwargs["thinking"] = {"type": "adaptive"}
-        else:
-            # All other models: manual thinking with explicit budget
-            kwargs["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": thinking_budget,
-            }
-            # Manual thinking requires higher max_tokens
-            kwargs["max_tokens"] = max(kwargs["max_tokens"], thinking_budget + 8000)
+    # Thinking configuration via shared helper (adaptive vs manual budget)
+    thinking_kwargs = build_thinking_kwargs(model, extended_thinking, thinking_budget)
+    kwargs.update(thinking_kwargs)
+    # If build_thinking_kwargs set max_tokens, it may be lower than our base;
+    # keep the higher of the two.
+    if "max_tokens" in thinking_kwargs:
+        kwargs["max_tokens"] = max(16384, thinking_kwargs["max_tokens"])
 
     # Effort parameter (models with adaptive thinking)
     if effort is not None and _supports_adaptive_thinking(model):
@@ -737,20 +1102,17 @@ async def run_agentic_loop(
     create_fn = client.beta.messages.create if context_1m else client.messages.create
 
     tool_call_count = 0
+    # Bound pause_turn continuations to avoid infinite loops when the model
+    # repeatedly yields without making progress.
+    MAX_PAUSE_CONTINUATIONS = 10
+    pause_continuation_count = 0
 
     while tool_call_count < max_tool_calls:
         response = await create_fn(**kwargs)
 
         # Check if we're done (no tool use)
         if response.stop_reason == "end_turn":
-            # Extract text and thinking from response
-            text_parts = []
-            thinking_parts = []
-            for block in response.content:
-                if block.type == "text":
-                    text_parts.append(block.text)
-                elif block.type == "thinking":
-                    thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
+            text, thinking = extract_text_and_thinking(response.content)
 
             # Add final assistant response to history (filter thinking blocks)
             messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
@@ -758,24 +1120,27 @@ async def run_agentic_loop(
             if ctx:
                 await ctx.report_progress(max_tool_calls, max_tool_calls, "Complete")
 
-            # Include thinking if present
-            if thinking_parts:
-                result = "\n\n".join(thinking_parts + text_parts)
-            else:
-                result = "\n".join(text_parts)
-            return result, messages
+            result = f"{thinking}\n\n{text}" if thinking else text
+            # F10: fall back to a marker when no text or thinking was produced
+            # (e.g. response is only redacted_thinking blocks)
+            return result or "[no text content; stop_reason=end_turn]", messages
 
         # Handle tool use
         if response.stop_reason == "tool_use":
             # Add assistant's response to messages (filter thinking blocks)
             messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
 
-            # Process each tool call
+            # Process each tool call.
+            # F8: execute_tool is synchronous and may block for up to MAX_FILE_SIZE
+            # bytes of file I/O or GIT_TIMEOUT (30 s) for git subprocesses.  Running
+            # it directly would starve the event loop; wrap in asyncio.to_thread so
+            # other coroutines (MCP pings, other sessions) can make progress.
+            # The threading locks already used by execute_tool make this safe.
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
                     tool_call_count += 1
-                    result = execute_tool(block.name, block.input)
+                    result = await asyncio.to_thread(execute_tool, block.name, block.input)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -792,39 +1157,76 @@ async def run_agentic_loop(
             kwargs["messages"] = messages
             continue
 
+        # F2: pause_turn means the model yielded the event loop but wants to
+        # continue.  Re-send with accumulated messages (per API docs).
+        # Bound continuations to avoid infinite loops.
+        if response.stop_reason == "pause_turn":
+            if pause_continuation_count >= MAX_PAUSE_CONTINUATIONS:
+                # Treat as terminal to avoid hanging forever
+                text, thinking = extract_text_and_thinking(response.content)
+                messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
+                result = f"{thinking}\n\n{text}" if thinking else text
+                return (
+                    result or f"[pause_turn limit reached after {pause_continuation_count} continuations]",
+                    messages,
+                )
+            pause_continuation_count += 1
+            # Append what we have so the model can see its own partial output,
+            # then re-send.
+            messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
+            kwargs["messages"] = messages
+            continue
+
+        # F2: Handle max_tokens and unknown stop reasons.  The response may
+        # end with tool_use blocks that were never resolved.  Persisting an
+        # assistant message with unresolved tool_use blocks poisons the session
+        # — the next API call will 400 with "tool_use ids found without
+        # tool_result blocks".  Fix: append a synthetic user message with
+        # tool_result blocks containing a placeholder explanation for each
+        # dangling tool_use_id.
+        dangling_tool_ids = [
+            block.id
+            for block in response.content
+            if getattr(block, "type", None) == "tool_use"
+        ]
+
         # Handle max_tokens - response was truncated
         if response.stop_reason == "max_tokens":
-            text_parts = []
-            thinking_parts = []
-            for block in response.content:
-                if block.type == "text":
-                    text_parts.append(block.text)
-                elif block.type == "thinking":
-                    thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
-
+            text, thinking = extract_text_and_thinking(response.content)
             messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
-
-            if thinking_parts:
-                result = "\n\n".join(thinking_parts + text_parts)
-            else:
-                result = "\n".join(text_parts)
+            if dangling_tool_ids:
+                # Synthesize tool_result entries so the session stays valid
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tid,
+                            "content": "[tool not executed: response truncated at max_tokens]",
+                        }
+                        for tid in dangling_tool_ids
+                    ],
+                })
+            result = f"{thinking}\n\n{text}" if thinking else text
             return f"{result}\n\n[Response truncated - max tokens reached]", messages
 
         # Unknown stop reason - extract what we have
-        text_parts = []
-        thinking_parts = []
-        for block in response.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "thinking":
-                thinking_parts.append(f"<thinking>\n{block.thinking}\n</thinking>")
-
+        text, thinking = extract_text_and_thinking(response.content)
         messages.append({"role": "assistant", "content": _filter_thinking_blocks(response.content, thinking_enabled)})
-
-        if thinking_parts:
-            result = "\n\n".join(thinking_parts + text_parts)
-        else:
-            result = "\n".join(text_parts)
+        if dangling_tool_ids:
+            # Synthesize tool_result entries so the session stays valid
+            messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tid,
+                        "content": f"[tool not executed: response stopped ({response.stop_reason})]",
+                    }
+                    for tid in dangling_tool_ids
+                ],
+            })
+        result = f"{thinking}\n\n{text}" if thinking else text
         return result or f"Stopped: {response.stop_reason}", messages
 
     # Max tool calls exceeded
@@ -850,8 +1252,8 @@ async def _consult(
     if not query or not query.strip():
         return "Error: Query cannot be empty."
 
-    if thinking_budget < 1000 or thinking_budget > 100000:
-        return "Error: thinking_budget must be between 1000 and 100000."
+    if thinking_budget < MIN_THINKING_BUDGET or thinking_budget > 100000:
+        return f"Error: thinking_budget must be between {MIN_THINKING_BUDGET} and 100000."
 
     # Validate file paths before touching the API
     if file_paths:
@@ -877,9 +1279,28 @@ async def _consult(
 
     client = get_client()
 
-    # Use async session lock to prevent concurrent access corruption
-    lock = get_session_lock(session_id)
-    async with lock:
+    # Use async session lock to prevent concurrent access corruption.
+    #
+    # F5 canonical-lock recheck: there is a race window between calling
+    # get_session_lock() and awaiting acquire() — cleanup_old_sessions() can
+    # delete the lock from _session_locks during that window, allowing a second
+    # coroutine to create a *different* lock for the same session.  Both would
+    # then proceed concurrently, interleaving history writes.
+    #
+    # Fix: after acquiring, verify that the lock we hold is still the one
+    # registered in _session_locks.  If cleanup raced us and a new lock was
+    # created, release and retry so we end up holding the canonical lock.
+    # This loop is O(1) in the normal case (cleanup races are rare).
+    while True:
+        lock = get_session_lock(session_id)
+        await lock.acquire()
+        # Re-check: is this still the canonical lock for the session?
+        if get_session_lock(session_id) is lock:
+            break
+        # Cleanup replaced the lock while we were acquiring it — release and retry.
+        lock.release()
+
+    try:
         session = await get_session(session_id, model_alias)
         model = session["model"]
 
@@ -888,9 +1309,20 @@ async def _consult(
         # Build the user message content
         content = build_content_blocks(query, file_paths, media_paths)
 
-        # Build message history with new user message
-        # Pass a copy to prevent corruption if the loop crashes mid-execution
-        current_messages = list(session["messages"])
+        # Snapshot how many messages are currently stored so we can identify
+        # the new turns appended by the loop (used below to preserve thinking
+        # blocks in stored history when extended_thinking is False).
+        stored_count = len(session["messages"])
+
+        # Build message history for the request.
+        # _build_messages_for_request returns a copy; when extended_thinking is
+        # False it strips thinking/redacted_thinking blocks from all assistant
+        # messages so the API does not reject them — without mutating the stored
+        # history (which is preserved so re-enabling thinking in a later call
+        # still has those blocks available).
+        current_messages = _build_messages_for_request(
+            session["messages"], extended_thinking
+        )
         current_messages.append({"role": "user", "content": content})
 
         try:
@@ -905,19 +1337,51 @@ async def _consult(
                 context_1m=context_1m,
                 ctx=ctx,
             )
-            # Only update session on success; prune to prevent unbounded growth
-            if len(updated_messages) > MAX_SESSION_MESSAGES:
-                updated_messages = updated_messages[-MAX_SESSION_MESSAGES:]
-            session["messages"] = updated_messages
+            # Compute how many new turns the loop appended.  The loop mutates
+            # current_messages in place, so updated_messages IS current_messages.
+            # We started with stored_count stored messages + 1 user message we
+            # appended above, so new turns start at index (stored_count + 1).
+            new_turns = updated_messages[stored_count + 1:]
+
+            # Reconstruct the stored messages by appending only the new turns
+            # onto the ORIGINAL stored history.  This preserves any thinking
+            # blocks in prior assistant messages even after a non-thinking turn.
+            merged_messages = list(session["messages"])
+            merged_messages.append({"role": "user", "content": content})
+            merged_messages.extend(new_turns)
+
+            # Prune to prevent unbounded growth.  Use turn-boundary pruning
+            # (_prune_messages) instead of naive tail-slicing so the retained
+            # head is always a plain user message.  Naive slicing can produce
+            # a head that starts with an assistant message or with a user
+            # tool_result message whose tool_use was just discarded — both
+            # cause the API to 400 on the next request in that session.
+            merged_messages = _prune_messages(merged_messages, MAX_SESSION_MESSAGES)
+            session["messages"] = merged_messages
+
+            # F6: refresh last_access after the loop completes, not just at call
+            # start. A long agentic run (1000 tool calls × multi-second round trips)
+            # can exceed SESSION_TTL from the start-of-call timestamp alone; updating
+            # here ensures the TTL reflects when the session was *last active*.
+            session["last_access"] = time.time()
 
             return response_text
 
         except anthropic.APIError as e:
+            # API errors are expected failure modes (bad key, rate-limit, etc.)
+            # — surface as a readable string so the MCP client can report them.
             logger.error(f"API error for session {session_id}: {e}")
             return f"Error communicating with Claude: {e}"
         except Exception as e:
-            logger.error(f"Error in session {session_id}: {e}")
-            return f"Error: {e}"
+            # F28: any non-APIError exception here is a cpal bug, not a user
+            # error.  logger.exception preserves the traceback in logs so it
+            # can be diagnosed.  Re-raise so FastMCP surfaces a proper tool
+            # error instead of silently converting the bug into a chat string
+            # — crash > silent fallback (project philosophy).
+            logger.exception(f"Internal error in session {session_id}: {e}")
+            raise
+    finally:
+        lock.release()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -961,11 +1425,15 @@ async def consult_claude(
     Args:
         query: The question or instruction.
         session_id: ID for conversation history (preserved across calls).
-        model: "opus" (default, precise), "sonnet" (fast), or "haiku" (quick scans/summaries).
+        model: "opus" (default, precise), "fable" (most capable, premium cost),
+            "sonnet" (fast), or "haiku" (quick scans/summaries).
         file_paths: Text files to include as context.
         media_paths: Images (.png, .jpg, .webp, .gif) or PDFs for vision analysis.
         extended_thinking: Enable chain-of-thought reasoning (recommended for analysis).
-        thinking_budget: Max tokens for thinking (default 10000, max ~100000).
+        thinking_budget: Min/max tokens for thinking (default 10000, min 1024, max ~100000).
+            Non-adaptive models clamp max_tokens to a per-model cap (128K for
+            Fable 5/Opus 4.6+, 64K for others); budget is reduced if it would
+            otherwise equal or exceed the cap.
         effort: Output effort level: "low", "medium", "high", or "max".
         context_1m: Enable 1M token context window (beta, tier 4+, premium pricing above 200K).
     """
@@ -980,7 +1448,7 @@ async def consult_claude(
 async def list_models() -> dict[str, Any]:
     """List available Claude models.
 
-    Returns model aliases (haiku, sonnet, opus) mapped to their
+    Returns model aliases (haiku, sonnet, opus, fable) mapped to their
     current versioned model IDs, with metadata about each tier.
     """
     aliases = await get_model_aliases()
@@ -989,11 +1457,7 @@ async def list_models() -> dict[str, Any]:
         "models": {
             alias: {
                 "id": model_id,
-                "description": {
-                    "haiku": "Fast exploration, quick questions",
-                    "sonnet": "Balanced reasoning, code review",
-                    "opus": "Deep reasoning, hard problems",
-                }.get(alias, ""),
+                "description": TIER_DESCRIPTIONS.get(alias, ""),
                 "extended_thinking": True,
                 "adaptive_thinking": _supports_adaptive_thinking(model_id),
                 "default_tool_calls": DEFAULT_TOOL_CALLS.get(alias, 1000),
@@ -1010,6 +1474,7 @@ async def count_tokens(
     system: str | None = None,
     file_paths: list[str] | None = None,
     thinking_budget: int = 10000,
+    extended_thinking: bool = True,
 ) -> dict[str, Any]:
     """Count tokens for a message without sending it (free endpoint).
 
@@ -1018,12 +1483,19 @@ async def count_tokens(
 
     Args:
         query: The message text to count tokens for.
-        model: Model to count against ("opus", "sonnet", "haiku").
+        model: Model to count against ("opus", "fable", "sonnet", "haiku").
         system: Custom system prompt (defaults to cpal's built-in prompt).
         file_paths: Text files to include in the count.
-        thinking_budget: Thinking budget to use for count (default 10000, ignored for adaptive).
+        thinking_budget: Thinking budget to use for count (default 10000, min 1024,
+            ignored for adaptive models). Must be >= 1024 (API minimum).
+        extended_thinking: Whether to include thinking params in the count (default True).
+            Set to False to mirror a consult_claude call with extended_thinking=False.
     """
     try:
+        # Validate thinking_budget before making any API calls
+        if extended_thinking and (thinking_budget < MIN_THINKING_BUDGET or thinking_budget > 100000):
+            return {"error": f"thinking_budget must be between {MIN_THINKING_BUDGET} and 100000."}
+
         # Validate file sizes before building content
         if file_paths:
             for path in file_paths:
@@ -1049,14 +1521,11 @@ async def count_tokens(
             "tools": CLAUDE_TOOLS,
         }
 
-        # Thinking affects token count — match actual request params
-        if _supports_adaptive_thinking(model_id):
-            kwargs["thinking"] = {"type": "adaptive"}
-        else:
-            kwargs["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": thinking_budget,
-            }
+        # Thinking affects token count — use shared helper to match actual request params
+        thinking_kwargs = build_thinking_kwargs(model_id, extended_thinking, thinking_budget)
+        # count_tokens does not use max_tokens, so only inject the thinking key
+        if "thinking" in thinking_kwargs:
+            kwargs["thinking"] = thinking_kwargs["thinking"]
 
         result = await client.messages.count_tokens(**kwargs)
         return {"input_tokens": result.input_tokens, "model": model_id}
@@ -1069,7 +1538,20 @@ async def count_tokens(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@mcp.tool(annotations=READONLY, timeout=30.0)
+# F33: create_batch is NOT read-only — it creates remote state and spends
+# money.  readOnlyHint=True was wrong; MCP hosts may auto-approve read-only
+# tools, which would allow create_batch to run silently without user consent.
+# destructiveHint=False is correct: batches cannot be retracted once submitted,
+# but the operation is not destructive to *existing* data.
+#
+# consult_claude is left as READONLY (a judgment call): it does not mutate
+# any persistent external state beyond ephemeral in-memory session history,
+# and the MCP session is the user's explicit intent.  The cost implication is
+# acknowledged in the docstring's "Cost note".
+_CREATE_BATCH_ANNOTATIONS = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
+
+
+@mcp.tool(annotations=_CREATE_BATCH_ANNOTATIONS, timeout=30.0)
 async def create_batch(
     queries: list[dict[str, str]],
     model: str = "opus",
@@ -1077,7 +1559,7 @@ async def create_batch(
     max_tokens: int = 16384,
     extended_thinking: bool = True,
     thinking_budget: int = 10000,
-    effort: str | None = "max",
+    effort: str | None = None,
     context_1m: bool = False,
 ) -> dict[str, Any]:
     """Create a message batch for fire-and-forget processing (50% cost discount).
@@ -1090,15 +1572,25 @@ async def create_batch(
 
     Args:
         queries: List of {custom_id: str, query: str} dicts.
-        model: Model alias or ID (default: "opus").
+        model: Model alias ("opus", "fable", "sonnet", "haiku") or full ID (default: "opus").
+            All tiers including Fable are available via batch.
         system: Custom system prompt (defaults to cpal's built-in prompt).
         max_tokens: Max output tokens per request (default: 16384).
         extended_thinking: Enable thinking (default: True).
-        thinking_budget: Thinking budget tokens (default: 10000, ignored for adaptive).
-        effort: Output effort level (default: "max"). Set None to omit.
+        thinking_budget: Thinking budget tokens (default: 10000, min 1024, ignored for adaptive).
+            Must be >= 1024 (API minimum). For non-adaptive models, max_tokens is clamped
+            to the model output cap (128K for Fable 5/Opus 4.6+, 64K otherwise).
+        effort: Output effort level (default: None = model default). Pass "low"/"medium"/"high"/"max"
+            to override. Opt-in only — "max" on bulk jobs can significantly amplify cost
+            (more output tokens per request × batch count) while defeating the cost-saving
+            purpose of the batch API.
         context_1m: Enable 1M token context window (beta, tier 4+, premium pricing above 200K).
     """
     try:
+        # Validate thinking_budget before making any API calls
+        if extended_thinking and (thinking_budget < MIN_THINKING_BUDGET or thinking_budget > 100000):
+            return {"error": f"thinking_budget must be between {MIN_THINKING_BUDGET} and 100000."}
+
         client = get_client()
         aliases = await get_model_aliases()
         model_id = aliases.get(model.lower(), model)
@@ -1117,15 +1609,12 @@ async def create_batch(
                 "messages": [{"role": "user", "content": query}],
             }
 
-            if extended_thinking:
-                if _supports_adaptive_thinking(model_id):
-                    params["thinking"] = {"type": "adaptive"}
-                else:
-                    params["thinking"] = {
-                        "type": "enabled",
-                        "budget_tokens": thinking_budget,
-                    }
-                    params["max_tokens"] = max(max_tokens, thinking_budget + 8000)
+            # Use shared helper for thinking config (adaptive vs manual budget)
+            thinking_kwargs = build_thinking_kwargs(model_id, extended_thinking, thinking_budget)
+            if "thinking" in thinking_kwargs:
+                params["thinking"] = thinking_kwargs["thinking"]
+            if "max_tokens" in thinking_kwargs:
+                params["max_tokens"] = max(max_tokens, thinking_kwargs["max_tokens"])
 
             if effort is not None and _supports_adaptive_thinking(model_id):
                 params.setdefault("output_config", {})["effort"] = effort
@@ -1195,6 +1684,9 @@ async def list_batches(limit: int = 20) -> dict[str, Any]:
         limit = max(1, min(limit, 100))  # Clamp to valid range
         client = get_client()
         batches = []
+        # NOTE: the SDK `limit` arg is a *page size*, not a total cap — the
+        # async iterator transparently fetches subsequent pages.  We must
+        # break out of the loop ourselves once we have enough entries.
         async for batch in client.messages.batches.list(limit=limit):
             entry: dict[str, Any] = {
                 "batch_id": batch.id,
@@ -1212,6 +1704,8 @@ async def list_batches(limit: int = 20) -> dict[str, Any]:
             if batch.ended_at:
                 entry["ended_at"] = str(batch.ended_at)
             batches.append(entry)
+            if len(batches) >= limit:
+                break
         return {"count": len(batches), "batches": batches}
     except Exception as e:
         return {"error": str(e)}
@@ -1306,7 +1800,7 @@ def server_info() -> dict[str, Any]:
         "version": __version__,
         "description": "your pal Claude - MCP server for Claude consultation",
         "default_model": "opus",
-        "supported_models": ["opus", "sonnet", "haiku"],
+        "supported_models": ["opus", "fable", "sonnet", "haiku"],
         "features": [
             "extended_thinking", "adaptive_thinking", "vision",
             "stateful_sessions", "batch", "token_counting", "effort",
@@ -1326,27 +1820,14 @@ async def models_resource() -> dict[str, Any]:
     return {
         "default": "opus",
         "models": {
-            "opus": {
-                "id": aliases["opus"],
-                "description": "Deep reasoning, hard problems",
-                "default_tool_calls": DEFAULT_TOOL_CALLS["opus"],
+            alias: {
+                "id": model_id,
+                "description": TIER_DESCRIPTIONS.get(alias, ""),
+                "default_tool_calls": DEFAULT_TOOL_CALLS.get(alias, 1000),
                 "extended_thinking": True,
-                "adaptive_thinking": _supports_adaptive_thinking(aliases["opus"]),
-            },
-            "sonnet": {
-                "id": aliases["sonnet"],
-                "description": "Balanced reasoning, code review",
-                "default_tool_calls": DEFAULT_TOOL_CALLS["sonnet"],
-                "extended_thinking": True,
-                "adaptive_thinking": _supports_adaptive_thinking(aliases["sonnet"]),
-            },
-            "haiku": {
-                "id": aliases["haiku"],
-                "description": "Fast exploration, quick questions",
-                "default_tool_calls": DEFAULT_TOOL_CALLS["haiku"],
-                "extended_thinking": True,
-                "adaptive_thinking": _supports_adaptive_thinking(aliases["haiku"]),
-            },
+                "adaptive_thinking": _supports_adaptive_thinking(model_id),
+            }
+            for alias, model_id in aliases.items()
         },
     }
 
@@ -1360,8 +1841,13 @@ def get_limits() -> dict[str, Any]:
         "max_search_files": MAX_SEARCH_FILES,
         "max_search_matches": MAX_SEARCH_MATCHES,
         "session_ttl_seconds": SESSION_TTL,
-        "thinking_budget_range": [1000, 100000],
-        "thinking_budget_note": "Adaptive thinking (Opus 4.6) ignores budget — model decides autonomously",
+        "thinking_budget_range": [MIN_THINKING_BUDGET, 100000],
+        "thinking_budget_note": (
+            "Adaptive-thinking models (Fable 5, Opus 4.6+, Sonnet 4.6) ignore budget — "
+            "model decides autonomously. Non-adaptive models clamp max_tokens to a "
+            "per-model output cap (128K for Fable 5/Opus 4.6+, 64K otherwise); "
+            "budget is reduced if it would otherwise equal or exceed the cap."
+        ),
     }
 
 
@@ -1476,18 +1962,27 @@ def main() -> None:
     if args.debug:
         logging.getLogger("cpal").setLevel(logging.DEBUG)
 
+    # F27: validate CPAL_MAX_TOOL_CALLS at startup — invalid/< 1 means the
+    # operator believes a cap is in place when it isn't.  Exit with a clear
+    # message rather than silently using defaults.
+    _validate_max_tool_calls_env()
+
     if args.key_file:
         if not args.key_file.exists():
             print(f"Error: Key file not found: {args.key_file}", file=sys.stderr)
             sys.exit(1)
         _api_key = args.key_file.read_text().strip()
 
-    # Load config and compose system prompt
+    # Load config and compose system prompt.
+    # F27: fail_fast_cli=True so that explicitly-passed --system-prompt files
+    # that cannot be read cause a clean startup failure rather than silently
+    # running without content the operator may depend on.
     config = _load_config()
     _system_prompt, _system_prompt_sources = _build_system_prompt(
         config,
         cli_prompt_files=args.system_prompt,
         no_default=args.no_default_prompt,
+        fail_fast_cli=True,
     )
     logger.info("System prompt sources: %s", _system_prompt_sources)
 

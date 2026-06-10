@@ -10,7 +10,7 @@ An MCP server that lets any AI consult Claude.
 
 ## Features
 
-- 🧠 **Opus by default** — deep reasoning (Sonnet/Haiku available)
+- 🧠 **Opus by default** — deep reasoning (Fable/Sonnet/Haiku available)
 - 💭 **Extended thinking** — explicit chain-of-thought for complex analysis
 - 🔧 **Autonomous exploration** — Claude reads files and searches your codebase
 - 📸 **Vision** — analyze images and PDFs
@@ -117,6 +117,7 @@ consult_claude(query="What does this function do?", extended_thinking=False)
 consult_claude(query="What's wrong with this UI?", media_paths=["screenshot.png"])
 
 # Different models
+consult_claude(query="Hardest problem", model="fable")  # most capable, premium cost
 consult_claude(query="Hard problem", model="opus")   # deep reasoning
 consult_claude(query="Quick check", model="haiku")   # fast & cheap
 
@@ -208,17 +209,18 @@ Check what's active via `resource://server/info` — it shows which sources cont
 - Path traversal and symlink attacks are blocked
 - Sessions are isolated per `session_id`
 - File size limits: 10MB text, 20MB media
+- Note: the read-only git tool can still reveal whole-repository commit history (e.g. `git log` or `git show` without a path argument), even when cpal is started in a subdirectory of a larger repository, because git operates on the full repository from any subdirectory.
 
 ## Batch API
 
 These are MCP tools your AI host can call — same as `consult_claude`, but for async bulk processing at 50% cost discount. Batches complete within 24 hours.
 
 ```python
-# Submit a batch
+# Submit a batch (any tier works — including Fable)
 create_batch(queries=[
     {"custom_id": "review-1", "query": "Review this code: ..."},
     {"custom_id": "review-2", "query": "Review this other code: ..."},
-])
+], model="fable")
 
 # Check status
 list_batches()
@@ -254,18 +256,19 @@ Model aliases are resolved automatically to the latest version per tier via the 
 
 | Alias | Fallback ID | Best For |
 |-------|-------------|----------|
-| `opus` | `claude-opus-4-5-20251101` | Deep reasoning, hard problems (default) |
-| `sonnet` | `claude-sonnet-4-5-20250929` | Balanced reasoning, code review |
-| `haiku` | `claude-haiku-4-5-20251001` | Fast exploration, quick questions |
+| `fable` | `claude-fable-5` | Most capable — frontier intelligence, premium cost |
+| `opus` | `claude-opus-4-8` | Deep reasoning, hard problems (default) |
+| `sonnet` | `claude-sonnet-4-6` | Balanced reasoning, code review |
+| `haiku` | `claude-haiku-4-5` | Fast exploration, quick questions |
 
 Claude can make up to 1000 autonomous tool calls per query by default. Override with the `CPAL_MAX_TOOL_CALLS` environment variable.
 
 ## Notes
 
-- **Sessions are in-memory** — history is lost when the server restarts. Sessions expire after 1 hour of inactivity.
+- **Sessions are in-memory** — history is lost when the server restarts. Sessions are eligible for expiry after 1 hour of inactivity; cleanup runs when the active session count exceeds 100.
 - **Models cost money** — Opus is the default and the most expensive. See [Anthropic pricing](https://www.anthropic.com/pricing#702702). Use `haiku` or `sonnet` for lower costs.
 - **Vision** — Supports PNG, JPEG, GIF, WebP, and PDF (max 20MB).
-- **1M context** — Requires [Anthropic API tier 4+](https://docs.anthropic.com/en/api/rate-limits#requirements-to-advance-tier). Premium pricing applies above 200K tokens. The default context window is 200K tokens.
+- **1M context** — Requires [Anthropic API tier 4+](https://docs.anthropic.com/en/api/rate-limits#requirements-to-advance-tier). Premium pricing applies above 200K tokens. The standard context window is 200K tokens; pass `context_1m=True` to access the 1M window via the beta endpoint.
 
 ## Development
 
